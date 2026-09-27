@@ -1,0 +1,7 @@
+node_modules/
+sourcemap.json
+tools/preview/out/
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx

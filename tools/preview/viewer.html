@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Zone Preview</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #a9d8ff;
+        font-family: system-ui, sans-serif;
+      }
+      #label {
+        position: fixed;
+        left: 12px;
+        top: 10px;
+        padding: 4px 10px;
+        border-radius: 6px;
+        background: rgb(0 0 0 / 0.45);
+        color: #fff;
+        font-size: 14px;
+      }
+    </style>
+    <script type="importmap">
+      {
+        "imports": {
+          "three": "./node_modules/three/build/three.module.js",
+          "three/addons/": "./node_modules/three/examples/jsm/"
+        }
+      }
+    </script>
+  </head>
+  <body>
+    <div id="label"></div>
+    <script type="module" src="./viewer.js"></script>
+  </body>
+</html>

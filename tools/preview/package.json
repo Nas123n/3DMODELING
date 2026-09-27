@@ -1,0 +1,13 @@
+{
+  "name": "zone-preview",
+  "private": true,
+  "type": "module",
+  "description": "Renders tools/preview/out/*.json scenes (built by `lune run tools/preview/build`) to PNGs.",
+  "scripts": {
+    "render": "node render.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.56.1",
+    "three": "0.170.0"
+  }
+}

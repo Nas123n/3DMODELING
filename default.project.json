@@ -1,0 +1,23 @@
+{
+  "name": "3dmodeling",
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "Shared": {
+        "$path": "src/shared"
+      }
+    },
+    "ServerStorage": {
+      "Builders": {
+        "$path": "src/builders"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "AmbientAnimator": {
+          "$path": "src/client/AmbientAnimator.client.luau"
+        }
+      }
+    }
+  }
+}

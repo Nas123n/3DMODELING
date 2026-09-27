@@ -131,8 +131,14 @@ function EggBuilder.buildEgg(
 	model:SetAttribute("Tier", tier.id)
 	model:SetAttribute("Variation", variation.id)
 	model:AddTag(EggBuilder.EGG_TAG)
+	-- Stream the egg in whole, so the client animator never captures a half-loaded pivot.
+	model.ModelStreamingMode = Enum.ModelStreamingMode.Atomic
 
 	local shell = Geometry.part(model, "Ellipsoid", center, Vector3.new(a * 2, h, a * 2), base, { name = "Shell" })
+	-- Clickable and hit by raycasts (ClickDetector, Mouse.Target) even though nothing collides.
+	shell.CanQuery = true
+	-- With a PrimaryPart the model pivots on it, so move that pivot down to the egg's base.
+	shell.PivotOffset = CFrame.new(0, -b, 0)
 	model.PrimaryPart = shell
 	model.WorldPivot = bottom
 
@@ -260,13 +266,14 @@ function EggBuilder.buildStand(tierId: string, cframe: CFrame, parent: Instance?
 		egg:SetAttribute("SpinSpeed", 0.6)
 	end
 
+	-- The board ends inside the posts and the posts rise past it: no coplanar faces to flicker.
 	for _, x in { -5.6, 5.6 } do
-		Geometry.part(stand, "Block", cframe * CFrame.new(x, 5.15, 1.9), Vector3.new(0.4, 8.3, 0.4), SIGN_STROKE, {
+		Geometry.part(stand, "Block", cframe * CFrame.new(x, 5.25, 1.9), Vector3.new(0.4, 8.5, 0.4), SIGN_STROKE, {
 			collide = true,
 			name = "SignPost",
 		})
 	end
-	local board = Geometry.part(stand, "Block", cframe * CFrame.new(0, 8.2, 1.9), Vector3.new(11.6, 2.2, 0.35), trim, {
+	local board = Geometry.part(stand, "Block", cframe * CFrame.new(0, 8.2, 1.9), Vector3.new(11.2, 2.2, 0.35), trim, {
 		collide = true,
 		name = "Sign",
 	})
@@ -276,9 +283,17 @@ function EggBuilder.buildStand(tierId: string, cframe: CFrame, parent: Instance?
 	return stand
 end
 
+local function replaceChild(parent: Instance?, name: string)
+	local existing = parent and parent:FindFirstChild(name)
+	if existing then
+		existing:Destroy()
+	end
+end
+
 -- Every tier's eggs at the origin, grouped as EggTemplates/<Tier>/<Egg name>, for game code
--- to clone (e.g. into ReplicatedStorage for hatch animations).
+-- to clone (e.g. into ReplicatedStorage for hatch animations). Replaces an earlier build.
 function EggBuilder.buildTemplates(parent: Instance?): Folder
+	replaceChild(parent, "EggTemplates")
 	local root = Instance.new("Folder")
 	root.Name = "EggTemplates"
 	for _, tier in EggConfig.Tiers do
@@ -294,7 +309,9 @@ function EggBuilder.buildTemplates(parent: Instance?): Folder
 end
 
 -- One stand per tier in a row centered on `origin`, for previewing every egg at once.
+-- Replaces an earlier gallery in the same parent.
 function EggBuilder.buildGallery(origin: CFrame, parent: Instance?): Folder
+	replaceChild(parent, "EggGallery")
 	local gallery = Instance.new("Folder")
 	gallery.Name = "EggGallery"
 	local count = #EggConfig.Tiers

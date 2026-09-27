@@ -35,7 +35,18 @@ return function(T, Loader)
 					T.equal(egg:GetAttribute("Tier"), tier.id)
 					T.equal(egg:GetAttribute("Variation"), variation.id)
 					T.check(egg:HasTag("Egg"), "egg tag")
-					T.equal(egg.PrimaryPart and egg.PrimaryPart.Name, "Shell")
+					local shell = egg.PrimaryPart
+					T.equal(shell and shell.Name, "Shell")
+					-- Roblox pivots a model with a PrimaryPart on PrimaryPart.CFrame * PivotOffset.
+					local pivot = (shell.CFrame * shell.PivotOffset).Position
+					T.near(
+						(pivot - roblox.Vector3.new(0, 5, 0)).Magnitude,
+						0,
+						1e-4,
+						`{variation.id} pivot is not its base`
+					)
+					T.check(shell.CanQuery, "shell must be clickable")
+					T.equal(egg.ModelStreamingMode, roblox.Enum.ModelStreamingMode.Atomic)
 					T.check(
 						countNamed(egg, PATTERN_PARTS[variation.pattern]) >= 3,
 						`{variation.id} has no {variation.pattern}`
@@ -94,8 +105,11 @@ return function(T, Loader)
 			end
 		end)
 
-		T.it("builds templates grouped by tier", function()
-			local templates = EggBuilder.buildTemplates()
+		T.it("builds templates grouped by tier, replacing an earlier build", function()
+			local holder = roblox.Instance.new("Folder")
+			EggBuilder.buildTemplates(holder)
+			local templates = EggBuilder.buildTemplates(holder)
+			T.equal(#holder:GetChildren(), 1, "second build should replace the first")
 			T.equal(#templates:GetChildren(), #EggConfig.Tiers)
 			for _, tier in EggConfig.Tiers do
 				T.equal(#templates:FindFirstChild(tier.id):GetChildren(), 3)

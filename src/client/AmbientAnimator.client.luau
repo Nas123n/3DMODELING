@@ -42,8 +42,19 @@ local function phaseFor(position: Vector3): number
 	return (position.X * 0.37 + position.Z * 0.73) % (math.pi * 2)
 end
 
+-- Only things in the world animate: not templates in ReplicatedStorage, and not instances
+-- that were destroyed or streamed out (they keep their tags after leaving).
+local function inWorld(instance: Instance): boolean
+	return instance:IsDescendantOf(workspace)
+end
+
+-- Called whenever Bob or Spin is added to or removed from an instance.
 local function refreshMover(instance: Instance)
 	if not instance:IsA("PVInstance") then
+		return
+	end
+	if not inWorld(instance) then
+		movers[instance] = nil
 		return
 	end
 	local bob, spin = instance:HasTag("Bob"), instance:HasTag("Spin")
@@ -72,14 +83,8 @@ local function refreshMover(instance: Instance)
 	mover.bob, mover.spin = bob, spin
 end
 
-local function forgetMover(instance: Instance)
-	if not instance:HasTag("Bob") and not instance:HasTag("Spin") then
-		movers[instance] = nil
-	end
-end
-
 local function addFlame(instance: Instance)
-	if not instance:IsA("PointLight") then
+	if not instance:IsA("PointLight") or not inWorld(instance) then
 		return
 	end
 	local holder = instance.Parent
@@ -108,8 +113,8 @@ local function watch(tag: string, added: (Instance) -> (), removed: (Instance) -
 	end
 end
 
-watch("Bob", refreshMover, forgetMover)
-watch("Spin", refreshMover, forgetMover)
+watch("Bob", refreshMover, refreshMover)
+watch("Spin", refreshMover, refreshMover)
 watch("Flicker", addFlame, removeFlame)
 
 local clock = 0

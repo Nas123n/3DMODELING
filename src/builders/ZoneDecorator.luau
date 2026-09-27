@@ -98,15 +98,16 @@ local function collectGround(zone: Instance, explicit: { Instance }?): { Instanc
 		return tagged
 	end
 
-	-- The widest flat part is the floor. Tiles that share its level, color and material
-	-- count too; a path or rug in a different color stays an obstacle.
+	-- The widest flat part is the floor (the lower one if a roof or ceiling is about as wide).
+	-- Tiles that share its level, color and material count too; a path or rug in a different
+	-- color stays an obstacle.
 	local widest: BasePart? = nil
-	local widestArea = 0
+	local widestArea, widestBottom = 0, math.huge
 	for _, part in candidates do
 		local low, high = worldExtents(part)
 		local area = (high.X - low.X) * (high.Z - low.Z)
-		if area > widestArea then
-			widest, widestArea = part, area
+		if area > widestArea * 1.1 or (area >= widestArea * 0.9 and low.Y < widestBottom) then
+			widest, widestArea, widestBottom = part, area, low.Y
 		end
 	end
 	if not widest then
@@ -249,19 +250,24 @@ function ZoneDecorator.decorate(zone: Instance, options: Options?): (Folder, Rep
 	rayParams.FilterType = Enum.RaycastFilterType.Exclude
 	local seeThrough: { Instance } = {}
 	rayParams.FilterDescendantsInstances = seeThrough
-	local rayOriginY = floorY + 80
-	local rayLength = floorY - bottomY + 160
 
 	-- Finds the floor under (x, z). Fails if something other than the floor is hit first,
 	-- which is how paths, platforms and props already sitting on the floor are avoided.
-	local function floorAt(x: number, z: number): Vector3?
+	-- The ray starts just above the prop's own height, so a roof, bridge or canopy higher
+	-- up doesn't count; obstructed() covers the space the prop itself will fill.
+	local function floorAt(x: number, z: number, clearance: number): Vector3?
+		local originY = floorY + clearance + 1
+		local direction = Vector3.new(0, -(originY - bottomY + 4), 0)
 		for _ = 1, 8 do
-			local hit = workspace:Raycast(Vector3.new(x, rayOriginY, z), Vector3.new(0, -rayLength, 0), rayParams)
+			local hit = workspace:Raycast(Vector3.new(x, originY, z), direction, rayParams)
 			if not hit then
 				return nil
 			end
 			local instance = hit.Instance
-			if (allowTerrain and instance:IsA("Terrain")) or table.find(groundParts, instance) then
+			if allowTerrain and instance:IsA("Terrain") then
+				return if hit.Material == Enum.Material.Water then nil else hit.Position
+			end
+			if table.find(groundParts, instance) then
 				return hit.Position
 			end
 			if instance:IsA("BasePart") and instance.Transparency >= 0.95 then
@@ -277,7 +283,7 @@ function ZoneDecorator.decorate(zone: Instance, options: Options?): (Folder, Rep
 
 	local overlapParams = OverlapParams.new()
 	overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-	overlapParams.FilterDescendantsInstances = groundParts
+	overlapParams.FilterDescendantsInstances = ground -- includes Terrain when it is the floor
 	local padding = opts.padding or 2
 
 	-- True when an existing object (not the floor) intrudes on the space a prop needs. Only the
@@ -319,7 +325,7 @@ function ZoneDecorator.decorate(zone: Instance, options: Options?): (Folder, Rep
 		if not occupied:fits(x, z, radius) or Scatter.insideAny(keepClear, x, z, radius) then
 			return false
 		end
-		local floor = floorAt(x, z)
+		local floor = floorAt(x, z, spec.height * scale)
 		if not floor or obstructed(floor, radius, spec.height * scale) then
 			return false
 		end

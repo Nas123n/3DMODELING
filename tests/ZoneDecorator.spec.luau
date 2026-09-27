@@ -198,6 +198,20 @@ return function(T, Loader)
 			end
 		end)
 
+		T.it("decorates under a roof as wide as the floor instead of on top of it", function()
+			local session, ZoneDecorator = fresh()
+			local zone = Scenes.zone(session, { name = "Cave", theme = "Den" })
+			local roof = zone:FindFirstChild("Floor"):Clone()
+			roof.Name = "Roof"
+			roof.CFrame = CFrame.new(0, 30, 0)
+			roof.Parent = zone
+			local folder, report = ZoneDecorator.decorate(zone)
+			T.check(report.props >= 40, `only {report.props} props under the roof`)
+			for _, model in propModels(folder) do
+				T.near(model.WorldPivot.Position.Y, 0, 0.01, `{model.Name} not on the floor`)
+			end
+		end)
+
 		T.it("keeps the previous decorations when a rebuild fails", function()
 			local session, ZoneDecorator = fresh()
 			local zone = Scenes.zone(session, { name = "Keep", theme = "Meadow" })

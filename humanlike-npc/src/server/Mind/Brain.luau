@@ -5,7 +5,11 @@
 -- comes due, the candidate list is scored and one is chosen softly; the activity runs and emits
 -- its intent; the overlays add talk, mirroring, emotes and fidgets on top. The spawn ritual
 -- (stand still, a first jump or camera spin, maybe "hi", then a short first walk) runs instead
--- of selection during the joining phase.
+-- of selection during the joining phase. A walking NPC very occasionally changes its mind
+-- (random abandonment, at most once per trip, never right after deciding or with the goal in
+-- sight); the step that drops a trip is flagged `changedMind`. In the far and dormant tiers the
+-- brain keeps choosing trips but skips overlays and every reaction that is not a system event.
+-- It is not the body: locomotion, path planning and the humanizer live in Nav/ and Runtime/.
 
 local Rng = require(script.Parent.Parent.Rng)
 local Needs = require(script.Parent.Needs)
@@ -30,11 +34,22 @@ type Event = Reaction.Event
 local Brain = {}
 Brain.__index = Brain
 
+-- Activities.Locomotion plus the distance still to walk (studs along the path; nil when the
+-- caller does not know, which never blocks an abandonment).
+export type Locomotion = {
+	status: string, -- "idle" | "planning" | "walking" | "arrived" | "failed"
+	goal: Vector3?,
+	moving: boolean,
+	onGround: boolean,
+	blockedBy: string?,
+	remaining: number?,
+}
+
 export type Input = {
 	now: number,
 	dt: number,
 	me: { id: string, position: Vector3, heading: Vector3, displayName: string, username: string },
-	locomotion: Activities.Locomotion,
+	locomotion: Locomotion,
 	world: Goals.World,
 	entity: (id: string) -> any?,
 	groupOf: (id: string) -> any?,
@@ -43,6 +58,8 @@ export type Input = {
 	playersWithin100: number,
 	chat: Overlays.ChatShared,
 	fellNearby: boolean?,
+	tier: string?, -- "near" | "mid" | "far" | "dormant" (Types.Tier); nil behaves as near
+	poiWord: string?, -- kind word of the POI the NPC stands at, handed to the talk overlay
 }
 
 export type Output = {
@@ -54,6 +71,7 @@ export type Output = {
 	typing: boolean,
 	phase: string,
 	mood: string,
+	changedMind: boolean?, -- true on the step where the brain dropped a running trip
 }
 
 export type BrainT = typeof(setmetatable(
@@ -89,8 +107,40 @@ export type BrainT = typeof(setmetatable(
 	Brain
 ))
 
+-- Event kinds raised by the runtime rather than sensed; the only ones a far NPC still reacts to.
+local SYSTEM_EVENT_KINDS: { [string]: boolean } = {
+	stuck = true,
+	fell = true,
+	flung = true,
+	goalInvalid = true,
+	avoidExit = true,
+	nameCollision = true,
+	serverClosing = true,
+	kicked = true,
+	gameEvent = true,
+	pathFailed = true,
+}
+
+-- What a far or dormant NPC may still choose: nobody is close enough to watch, so only the
+-- trip-shaped activities that keep it moving through the place (and standing still, and leaving).
+local QUIET_ACTIVITIES: { [string]: boolean } = {
+	VisitPoi = true,
+	Wander = true,
+	Explore = true,
+	IdleStand = true,
+	Leave = true,
+}
+
+-- Never abandon a trip in its first seconds or once the goal is this close.
+local ABANDON_MIN_TRIP_SECONDS = 3
+local ABANDON_MIN_REMAINING = 8
+
 local function u(rng: Rng, lo: number, hi: number): number
 	return rng:range(lo, hi)
+end
+
+local function isQuiet(tier: string?): boolean
+	return tier == "far" or tier == "dormant"
 end
 
 function Brain.new(rng: Rng, persona: any, now: number, favoritePoiKind: string?): BrainT
@@ -397,6 +447,37 @@ local function firstTripBonus(self: BrainT, candidates: { Candidate }, input: In
 	end
 end
 
+-- Random abandonment of the running trip: p = dt * (0.002 + 0.006 * impulsivity) per step, never
+-- in the first seconds of a trip, never with the goal within a few studs. Since it ends the
+-- activity it can fire at most once per trip. Half the time the NPC first walks back for a
+-- moment (about-face) before choosing again; otherwise it chooses again on this very step.
+-- Returns true when the trip was dropped.
+local function maybeAbandon(self: BrainT, input: Input, ctx: Activities.Context): boolean
+	local activity = self.activity
+	if not activity or not activity.hasTrip or self.activityStatus ~= "running" or not input.locomotion.moving then
+		return false
+	end
+	local now = input.now
+	if now - self.startedAt < ABANDON_MIN_TRIP_SECONDS then
+		return false
+	end
+	local remaining = input.locomotion.remaining
+	if remaining ~= nil and remaining < ABANDON_MIN_REMAINING then
+		return false
+	end
+	local rng = self.rng
+	if not rng:chance(input.dt * (0.002 + 0.006 * self.persona.impulsivity)) then
+		return false
+	end
+	stopActivity(self, ctx, "abandoned", now)
+	self.activityStatus = "abandoned"
+	if rng:chance(0.5) then
+		self.aboutFaceUntil = now + u(rng, 0.4, 0.9)
+		self.aboutFaceDir = -input.me.heading
+	end
+	return true
+end
+
 function Brain.step(self: BrainT, input: Input): Output
 	local now, dt = input.now, input.dt
 	local rng = self.rng
@@ -404,6 +485,8 @@ function Brain.step(self: BrainT, input: Input): Output
 	local intents: { Intent } = {}
 	local actions: { Action } = {}
 	local suppress: { [string]: boolean } = {}
+	local quiet = isQuiet(input.tier)
+	local changedMind = false
 
 	-- 1. Bookkeeping.
 	if now - self.lastDecayAt > 5 then
@@ -425,17 +508,29 @@ function Brain.step(self: BrainT, input: Input): Output
 		self.forceReselect = true
 	end
 
-	-- 2. Events: absorb, queue with reaction delay, then weigh the due ones.
+	-- 2. Events: absorb, queue with reaction delay, then weigh the due ones. Far and dormant
+	-- NPCs are not sensed at, so nothing sensed gets in and only system events come due.
 	local salient = false
-	for _, ev in input.events do
-		absorb(self, ev, now)
-		if ev.salience >= 0.6 then
-			salient = true
+	if not quiet then
+		for _, ev in input.events do
+			absorb(self, ev, now)
+			if ev.salience >= 0.6 then
+				salient = true
+			end
+			Reaction.push(self.reactions, ev, now, persona, self.mood.name, rng)
 		end
-		Reaction.push(self.reactions, ev, now, persona, self.mood.name, rng)
 	end
 	Mood.update(self.mood, now, self.needs, moodContext(self, input, now), persona, rng, salient)
 	local due = Reaction.due(self.reactions, now)
+	if quiet then
+		local kept: { Event } = {}
+		for _, ev in due do
+			if SYSTEM_EVENT_KINDS[ev.kind] then
+				table.insert(kept, ev)
+			end
+		end
+		due = kept
+	end
 	local pending: Event? = nil
 	local resistance = if self.activity then Utility.resistance(self.activity.name, self.state) else 0
 	for _, ev in due do
@@ -451,27 +546,27 @@ function Brain.step(self: BrainT, input: Input): Output
 	if not self.ritual.done then
 		tickRitual(self, input, intents, actions, suppress)
 	else
-		-- About-face after an abandon: walk back briefly before choosing again.
+		-- Random abandonment of trips (may start an about-face that defers the next choice).
+		if now >= self.aboutFaceUntil and maybeAbandon(self, input, ctx) then
+			changedMind = true
+		end
 		if now < self.aboutFaceUntil then
+			-- About-face after an abandon: walk back briefly before choosing again.
 			table.insert(
 				intents,
 				{ kind = "step", dir = self.aboutFaceDir or -input.me.heading, duration = self.aboutFaceUntil - now }
 			)
 		else
 			local status = self.activityStatus
-			-- Random abandonment of trips.
-			if self.activity and self.activity.hasTrip and status == "running" and input.locomotion.moving then
-				if rng:chance(dt * (0.004 + 0.012 * persona.impulsivity)) then
-					stopActivity(self, ctx, "abandoned", now)
-					status = "abandoned"
-					if rng:chance(0.5) then
-						self.aboutFaceUntil = now + u(rng, 0.8, 2)
-						self.aboutFaceDir = -input.me.heading
-					end
-				end
-			end
 			if pending or status ~= "running" or self.forceReselect or now >= self.nextReviewAt then
 				local candidates = Goals.candidates(goalsContext(self, input), pending)
+				if quiet then
+					for i = #candidates, 1, -1 do
+						if not QUIET_ACTIVITIES[candidates[i].activity] then
+							table.remove(candidates, i)
+						end
+					end
+				end
 				-- A finished trip is usually followed by a short pause before the next thing.
 				if status == "success" and self.lastTripEndedAt == now then
 					for _, c in candidates do
@@ -497,7 +592,12 @@ function Brain.step(self: BrainT, input: Input): Output
 				local forced = pending ~= nil or status ~= "running" or self.forceReselect
 				local chosen = Utility.select(scored, current, persona, rng, forced)
 				if chosen and chosen ~= current then
-					if self.activity then
+					local previous = self.activity
+					if previous then
+						-- Swapping out a trip that was still under way is a change of mind.
+						if previous.hasTrip and status == "running" then
+							changedMind = true
+						end
 						stopActivity(self, ctx, if pending then "interrupted" else status, now)
 					end
 					startActivity(self, ctx, chosen, now)
@@ -521,58 +621,72 @@ function Brain.step(self: BrainT, input: Input): Output
 		end
 	end
 
-	-- 5. Overlays.
-	local groupMembers: { [string]: boolean } = {}
-	local myGroup = input.groupOf(input.me.id)
-	if myGroup then
-		for _, id in myGroup.members do
-			groupMembers[id] = true
+	-- 5. Overlays. Far and dormant NPCs skip them: nobody is close enough to read a line or
+	-- see a fidget, so the talk and emote actions activities asked for are dropped too.
+	local overlay: Overlays.Output? = nil
+	if quiet then
+		for i = #actions, 1, -1 do
+			local kind = actions[i].kind
+			if kind == "forceLine" or kind == "say" or kind == "emote" then
+				table.remove(actions, i)
+			end
 		end
-	end
-	local nearbyName: string? = nil
-	for _, e in input.world.entities do
-		if input.world.visible[e.id] then
-			nearbyName = e.displayName
-			break
+		self.wakeBurst = false
+	else
+		local groupMembers: { [string]: boolean } = {}
+		local myGroup = input.groupOf(input.me.id)
+		if myGroup then
+			for _, id in myGroup.members do
+				groupMembers[id] = true
+			end
 		end
-	end
-	local overlayCtx: Overlays.Context = {
-		now = now,
-		dt = dt,
-		rng = rng,
-		persona = persona,
-		me = input.me,
-		moving = input.locomotion.moving,
-		onGround = input.locomotion.onGround,
-		mood = self.mood.name,
-		phase = self.session.phase,
-		activity = if self.activity then self.activity.name else nil,
-		suppress = suppress,
-		inGroup = myGroup ~= nil,
-		groupMembers = groupMembers,
-		playersWithin30 = input.playersWithin30,
-		playersWithin100 = input.playersWithin100,
-		nearbyName = nearbyName,
-		entity = input.entity,
-		guard = self.guard,
-		attachment = self.guard.attachment,
-		chat = input.chat,
-		events = due,
-		wakeBurst = self.wakeBurst,
-		fellNearby = input.fellNearby,
-	}
-	-- Forced lines requested by activities go through the overlay's composer.
-	for i = #actions, 1, -1 do
-		local a = actions[i]
-		if a.kind == "forceLine" then
-			table.remove(actions, i)
-			self.overlays:forceLine(overlayCtx, a.category or "reaction", a.target)
+		local nearbyName: string? = nil
+		for _, e in input.world.entities do
+			if input.world.visible[e.id] then
+				nearbyName = e.displayName
+				break
+			end
 		end
-	end
-	local overlay = self.overlays:tick(overlayCtx)
-	self.wakeBurst = overlayCtx.wakeBurst == true
-	for _, a in overlay.actions do
-		table.insert(actions, a)
+		local overlayCtx: Overlays.Context = {
+			now = now,
+			dt = dt,
+			rng = rng,
+			persona = persona,
+			me = input.me,
+			moving = input.locomotion.moving,
+			onGround = input.locomotion.onGround,
+			mood = self.mood.name,
+			phase = self.session.phase,
+			activity = if self.activity then self.activity.name else nil,
+			suppress = suppress,
+			inGroup = myGroup ~= nil,
+			groupMembers = groupMembers,
+			playersWithin30 = input.playersWithin30,
+			playersWithin100 = input.playersWithin100,
+			nearbyName = nearbyName,
+			entity = input.entity,
+			guard = self.guard,
+			attachment = self.guard.attachment,
+			chat = input.chat,
+			events = due,
+			wakeBurst = self.wakeBurst,
+			fellNearby = input.fellNearby,
+			poiWord = input.poiWord,
+		}
+		-- Forced lines requested by activities go through the overlay's composer.
+		for i = #actions, 1, -1 do
+			local a = actions[i]
+			if a.kind == "forceLine" then
+				table.remove(actions, i)
+				self.overlays:forceLine(overlayCtx, a.category or "reaction", a.target)
+			end
+		end
+		local ticked = self.overlays:tick(overlayCtx)
+		overlay = ticked
+		self.wakeBurst = overlayCtx.wakeBurst == true
+		for _, a in ticked.actions do
+			table.insert(actions, a)
+		end
 	end
 
 	-- Merge intents: travel from the activity is the base; an activity-level step, jump or face
@@ -591,8 +705,9 @@ function Brain.step(self: BrainT, input: Input): Output
 			intent = i
 		end
 	end
-	if overlay.intent then
-		local o = overlay.intent
+	local overlayIntent = if overlay then overlay.intent else nil
+	if overlayIntent then
+		local o = overlayIntent
 		if o.kind == "freeze" then
 			intent = o
 		elseif o.kind == "jump" then
@@ -614,20 +729,33 @@ function Brain.step(self: BrainT, input: Input): Output
 		activity = if self.activity then self.activity.name else nil,
 		target = if self.currentScored then self.currentScored.candidate.target else nil,
 		interrupted = pending ~= nil,
-		typing = overlay.typing,
+		typing = if overlay then overlay.typing else false,
 		phase = self.session.phase,
 		mood = self.mood.name,
+		changedMind = changedMind,
 	}
 end
 
--- Locomotion tells the brain a trip failed for good (recovery exhausted) or the body fell.
-function Brain.onSystemEvent(self: BrainT, kind: string, now: number, position: Vector3?)
+-- The runtime tells the brain something happened to the body or the session: a trip failed for
+-- good (recovery exhausted), the body fell or was flung, a goal turned out invalid, someone with
+-- this name joined ("nameCollision": the session now ends within LNc(20, 0.4, 5, 45) s), the
+-- server is closing ("serverClosing": leave now), or a game event fired (`data`). Kinds without
+-- a special rule become a system reaction, fail the running activity and force a new choice.
+function Brain.onSystemEvent(self: BrainT, kind: string, now: number, position: Vector3?, data: any?)
+	if kind == "nameCollision" then
+		local leaveAt = now + self.rng:logNormalClamped(20, 0.4, 5, 45)
+		self.session.leaveAt = math.min(self.session.leaveAt, leaveAt)
+		return
+	elseif kind == "serverClosing" then
+		self:leaveNow()
+		return
+	end
 	if kind == "stuck" and position then
 		Memory.recordStuck(self.memory, position, now)
 	end
 	Reaction.push(
 		self.reactions,
-		{ kind = kind, salience = 1.0, expected = true, at = now },
+		{ kind = kind, salience = 1.0, expected = true, at = now, data = data },
 		now,
 		self.persona,
 		self.mood.name,

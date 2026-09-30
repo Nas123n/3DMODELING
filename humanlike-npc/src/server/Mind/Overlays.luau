@@ -1,18 +1,22 @@
 --!strict
 -- Behaviour that runs on top of whatever activity is current: talking (spontaneous spurts,
--- replies, the typing freeze), mirroring nearby people (a copied jump a second later, a copied
--- emote, an echoed line, a shadowed step), emoting, and fidgeting (jump bursts, shift-lock
--- yaw sweeps, the abrupt wake after AFK). Each overlay returns at most one intent override and
+-- replies, the typing freeze planned by Chat/TypingFreeze and the typing-indicator action that
+-- brackets every line), mirroring nearby people (a copied jump a second later, a copied emote,
+-- an echoed corpus line, a shadowed step), emoting, and fidgeting (jump bursts, shift-lock yaw
+-- sweeps, the abrupt wake after AFK). Each overlay returns at most one intent override and
 -- some actions; the activity's suppression flags are honoured so an AFK NPC stays dead still.
+-- Echoes re-render corpus lines looked up by lineId: a player's bytes are never repeated.
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
 local Timing = require(script.Parent.Parent.Timing)
 local JumpHabit = require(script.Parent.Parent.Human.JumpHabit)
+local ChatCorpus = require(script.Parent.Parent.Chat.ChatCorpus)
 local Composer = require(script.Parent.Parent.Chat.Composer)
 local Reply = require(script.Parent.Parent.Chat.Reply)
 local Recency = require(script.Parent.Parent.Chat.Recency)
 local Safety = require(script.Parent.Parent.Chat.Safety)
+local TypingFreeze = require(script.Parent.Parent.Chat.TypingFreeze)
 local Mood = require(script.Parent.Mood)
 local SocialGuard = require(script.Parent.SocialGuard)
 local Activities = require(script.Parent.Activities)
@@ -29,6 +33,10 @@ export type ChatShared = {
 	safety: Safety.Gate,
 	-- Server-wide rate limiter: true when one more line may be sent now.
 	allow: (npcId: string, now: number) -> boolean,
+	-- Chat/ChatGuard.Guard when the service has one (typed loosely: the guard lands separately
+	-- and this module only needs guard:allow(npcId, now, isReply)). When present, `allow` is
+	-- ignored and the guard decides; it records the line itself when it says yes.
+	guard: any?,
 }
 
 export type Context = {
@@ -55,6 +63,7 @@ export type Context = {
 	events: { any }, -- reaction events delivered this step
 	wakeBurst: boolean?,
 	fellNearby: boolean?,
+	poiWord: string?, -- the kind word of the POI the NPC stands at (or its PoiWord), for {poi} lines
 }
 
 export type Output = {
@@ -63,7 +72,15 @@ export type Output = {
 	typing: boolean,
 }
 
-type Pending = { at: number, text: string, lineId: string, target: string?, category: string, resumeAt: number }
+type Pending = {
+	at: number,
+	text: string,
+	lineId: string,
+	target: string?,
+	category: string,
+	resumeAt: number,
+	isReply: boolean, -- an answer to a heard line: the guard lets replies past its share rules
+}
 
 export type State = typeof(setmetatable(
 	{} :: {
@@ -79,6 +96,9 @@ export type State = typeof(setmetatable(
 		freezeVariant: string,
 		probedBy: { [string]: boolean },
 		lastLineAt: number,
+		typingRng: Rng, -- the "typing" stream: every TypingFreeze draw
+		typingPlan: TypingFreeze.Plan?, -- how the body waits while the pending line is typed
+		typingSignalled: boolean, -- the indicator state last sent as a "typing" action
 		-- mirror
 		mirrorQueue: {
 			{
@@ -113,34 +133,46 @@ local function episodeGap(rng: Rng, chattiness: number): number
 end
 
 function Overlays.new(rng: Rng, persona: any, now: number): State
+	-- The draw order below is pinned ("jumps", "talk", "lines" forks, then the first yaw gap).
+	-- The typing stream is forked from the talk stream after that stream's only draw, so adding
+	-- it moved no value that existed before.
+	local jumpHabit = JumpHabit.new(rng:fork("jumps"), persona.profile, now, persona.jumpTier)
+	local talkRng = rng:fork("talk")
+	local nextEpisodeAt = now + episodeGap(talkRng, persona.chattiness) * rng:range(0.1, 1)
+	local lineBurst = Timing.newBurst(rng:fork("lines"), {
+		interMedian = 25,
+		interSpread = 0.7,
+		withinMean = 6,
+		withinDev = 2,
+		withinLo = 3,
+		withinHi = 12,
+		lengthP = 0.45,
+		maxLength = 4,
+		interLo = 5,
+		interHi = 300,
+	}, now)
+	local nextYawAt = now + rng:logNormalClamped(6, 0.8, 2, 40)
+	local typingRng = talkRng:fork("typing")
 	local self = setmetatable({
 		rng = rng,
 		persona = persona,
-		jumpHabit = JumpHabit.new(rng:fork("jumps"), persona.profile, now, persona.jumpTier),
-		nextEpisodeAt = now + episodeGap(rng:fork("talk"), persona.chattiness) * rng:range(0.1, 1),
+		jumpHabit = jumpHabit,
+		nextEpisodeAt = nextEpisodeAt,
 		talkativeUntil = 0,
-		lineBurst = Timing.newBurst(rng:fork("lines"), {
-			interMedian = 25,
-			interSpread = 0.7,
-			withinMean = 6,
-			withinDev = 2,
-			withinLo = 3,
-			withinHi = 12,
-			lengthP = 0.45,
-			maxLength = 4,
-			interLo = 5,
-			interHi = 300,
-		}, now),
+		lineBurst = lineBurst,
 		pending = nil,
 		freezeUntil = -math.huge,
 		freezeVariant = "still",
 		probedBy = {},
 		lastLineAt = -math.huge,
+		typingRng = typingRng,
+		typingPlan = nil,
+		typingSignalled = false,
 		mirrorQueue = {},
 		lastMirrorAt = -math.huge,
 		mirrorsThisMinute = {},
 		emoteUntil = -math.huge,
-		nextYawAt = now + rng:logNormalClamped(6, 0.8, 2, 40),
+		nextYawAt = nextYawAt,
 		yawUntil = 0,
 		yawTarget = nil,
 		wasMoving = false,
@@ -148,7 +180,8 @@ function Overlays.new(rng: Rng, persona: any, now: number): State
 	return self
 end
 
--- Queues a line for sending after its typing time, freezing movement meanwhile.
+-- Queues a line for sending after its typing time. The body follows a TypingFreeze plan until
+-- the pinned resume moment after the line is said; the indicator action follows with the tick.
 local function schedule(
 	self: State,
 	ctx: Context,
@@ -156,15 +189,13 @@ local function schedule(
 	lineId: string,
 	category: string,
 	target: string?,
-	addressed: boolean
+	addressed: boolean,
+	isReply: boolean?
 )
 	local rng = self.rng
 	local latency = Reply.latency(text, self.persona.voice, rng, addressed)
 	local at = ctx.now + latency
-	local variant = "still"
-	if not self.persona.profile.analog and ctx.moving and rng:chance(0.15) then
-		variant = "walkStraight"
-	end
+	local plan = TypingFreeze.plan(self.typingRng, self.persona.profile.kind, ctx.moving, latency, ctx.me.heading)
 	self.pending = {
 		at = at,
 		text = text,
@@ -172,9 +203,53 @@ local function schedule(
 		target = target,
 		category = category,
 		resumeAt = at + u(rng, 0.5, 2.0),
+		isReply = isReply == true,
 	}
 	self.freezeUntil = (self.pending :: Pending).resumeAt
-	self.freezeVariant = variant
+	self.freezeVariant = if plan.variant == "heldKey" then "walkStraight" else plan.variant
+	-- The freeze ends at resumeAt (pinned); the plan only says how the body waits until then.
+	plan.startedAt = ctx.now
+	plan.total = if plan.variant == "free" then 0 else self.freezeUntil - ctx.now
+	self.typingPlan = plan
+end
+
+-- One more line may go out now: the ChatGuard when the service has one, else the plain limiter.
+local function allowed(ctx: Context, isReply: boolean): boolean
+	local guard = ctx.chat.guard
+	if guard ~= nil then
+		return guard:allow(ctx.me.id, ctx.now, isReply) == true
+	end
+	return ctx.chat.allow(ctx.me.id, ctx.now)
+end
+
+-- The corpus text behind a heard line's id ("category:text", the Composer's form), with its
+-- slots dropped and short enough to be copied; nil for anything that is not a corpus line. This
+-- is the only way a heard line reaches an {echo} slot, so a player's bytes are never repeated.
+local function echoSource(lineId: any): string?
+	if type(lineId) ~= "string" then
+		return nil
+	end
+	local category, text = string.match(lineId, "^([^:]+):(.*)$")
+	if not category or not text then
+		return nil
+	end
+	local found = false
+	for _, line in ChatCorpus.byCategory(category) do
+		if line.text == text then
+			found = true
+			break
+		end
+	end
+	if not found then
+		return nil
+	end
+	local source = string.gsub(text, "%s*{%w+}%s*", " ")
+	source = string.gsub(source, "^%s+", "")
+	source = string.gsub(source, "%s+$", "")
+	if #source == 0 or #source > 12 then
+		return nil
+	end
+	return source
 end
 
 local function compose(self: State, ctx: Context, category: string?, target: string?, echo: string?): Composer.Composed?
@@ -192,6 +267,7 @@ local function compose(self: State, ctx: Context, category: string?, target: str
 		nearbyName = targetName or ctx.nearbyName,
 		echoSource = echo,
 		allowRude = self.persona.trolliness > 0.6 and ctx.mood ~= "social",
+		poiWord = ctx.poiWord,
 	}, ctx.chat.recency, ctx.chat.safety)
 end
 
@@ -205,7 +281,8 @@ function Overlays.forceLine(self: State, ctx: Context, category: string, target:
 	end
 	local composed = compose(self, ctx, category, target, nil)
 	if composed then
-		schedule(self, ctx, composed.text, composed.lineId, composed.category, target, true)
+		-- A probe answer replies to something heard; other forced lines are the NPC's own.
+		schedule(self, ctx, composed.text, composed.lineId, composed.category, target, true, category == "probe")
 	end
 end
 
@@ -255,7 +332,8 @@ local function onHeard(self: State, ctx: Context, ev: any)
 			composed.lineId,
 			composed.category,
 			fromId,
-			classified.named or classified.kind ~= "broadcast"
+			classified.named or classified.kind ~= "broadcast",
+			true
 		)
 	end
 end
@@ -273,7 +351,7 @@ local function tickTalk(self: State, ctx: Context, out: Output)
 	local pending = self.pending
 	if pending and ctx.now >= pending.at then
 		self.pending = nil
-		if ctx.chat.allow(ctx.me.id, ctx.now) and not ctx.suppress.talk then
+		if not ctx.suppress.talk and allowed(ctx, pending.isReply) then
 			table.insert(
 				out.actions,
 				{ kind = "say", text = pending.text, lineId = pending.lineId, target = pending.target }
@@ -298,11 +376,16 @@ local function tickTalk(self: State, ctx: Context, out: Output)
 		end
 	end
 
-	-- Typing freeze.
+	-- Typing freeze: the plan drawn when the line was scheduled says how the body waits.
 	if ctx.now < self.freezeUntil then
 		out.typing = true
-		if p.profile.typingFreezes then
-			out.intent = { kind = "freeze", duration = self.freezeUntil - ctx.now, variant = self.freezeVariant }
+		local plan = self.typingPlan
+		if p.profile.typingFreezes and plan then
+			local intent = TypingFreeze.intent(plan, ctx.now)
+			if intent then
+				intent.duration = self.freezeUntil - ctx.now
+				out.intent = intent
+			end
 		end
 	end
 
@@ -376,11 +459,13 @@ local function tickMirror(self: State, ctx: Context, out: Output)
 				name = name,
 				movingAtSchedule = ctx.moving,
 			})
-		elseif ev.kind == "chatHeard" and ev.data and ev.data.text and #ev.data.text <= 12 then
-			if rng:chance(0.08 + 0.3 * p.mirroring * p.chattiness) then
+		elseif ev.kind == "chatHeard" and ev.data then
+			-- Only a corpus line known by its lineId can be echoed, never the heard bytes.
+			local source = echoSource(ev.data.lineId)
+			if source and rng:chance(0.08 + 0.3 * p.mirroring * p.chattiness) then
 				table.insert(
 					self.mirrorQueue,
-					{ at = ctx.now + u(rng, 3, 10), kind = "echo", echo = ev.data.text, movingAtSchedule = ctx.moving }
+					{ at = ctx.now + u(rng, 3, 10), kind = "echo", echo = source, movingAtSchedule = ctx.moving }
 				)
 			end
 		end
@@ -514,6 +599,13 @@ function Overlays.tick(self: State, ctx: Context): Output
 	tickEmote(self, ctx, out)
 	tickFidget(self, ctx, out)
 	self.wasMoving = ctx.moving
+	-- The typing indicator brackets every line: on once a line is queued, off once it was said
+	-- or dropped (after the say action of the same tick, which was added first).
+	local typingNow = self.pending ~= nil
+	if typingNow ~= self.typingSignalled then
+		self.typingSignalled = typingNow
+		table.insert(out.actions, { kind = "typing", on = typingNow })
+	end
 	return out
 end
 

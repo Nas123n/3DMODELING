@@ -5,7 +5,9 @@
 -- reshapes what it is willing to do: nobody goes AFK ten seconds after spawning and nobody starts
 -- exploring on the way out, which the phase weight table expresses as multipliers on activity
 -- utility. leaveAt comes from the persona's session length and can be pulled in by the
--- population manager when the server needs the slot.
+-- population manager when the server needs the slot, or by the brain when someone with the same
+-- name joins. This module keeps no clock and chooses no activity.
+-- requires: Personality, Rng
 
 local Personality = require(script.Parent.Personality)
 local Rng = require(script.Parent.Parent.Rng)
@@ -87,9 +89,19 @@ function Session.finishRitual(session: Session)
 	session.ritualDone = true
 end
 
--- Population overflow: the NPC leaves within a few minutes.
-function Session.shorten(session: Session, now: number, rng: Rng)
-	session.leaveAt = now + rng:logNormalClamped(60, 0.5, 20, 180)
+-- Population overflow: the NPC leaves within a few minutes (LNc(60, 0.5, 20, 180) s by default).
+-- The optional parameters reshape the draw for other exits, such as a name collision's
+-- LNc(20, 0.4, 5, 45); the defaults are the landed values.
+function Session.shorten(
+	session: Session,
+	now: number,
+	rng: Rng,
+	median: number?,
+	spread: number?,
+	lo: number?,
+	hi: number?
+)
+	session.leaveAt = now + rng:logNormalClamped(median or 60, spread or 0.5, lo or 20, hi or 180)
 end
 
 -- Escape (ReactProbe) or an explicit despawn request: straight to leaving.

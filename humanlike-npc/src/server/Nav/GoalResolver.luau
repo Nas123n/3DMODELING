@@ -3,6 +3,7 @@
 -- they do not stand still computing. This turns an unreachable goal into a short list of
 -- reachable stand-ins: points along the line toward it, and the nearest other place of
 -- interest. The planner tries them in order and tells the brain which one it ended up with.
+-- requires: NavGrid, NavMath, PoiRegistry
 
 local NavGrid = require(script.Parent.NavGrid)
 local NavMath = require(script.Parent.NavMath)

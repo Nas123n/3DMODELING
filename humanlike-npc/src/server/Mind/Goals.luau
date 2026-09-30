@@ -3,7 +3,10 @@
 -- somewhere to wander toward, people to follow or watch, groups to join, spots to stand on, and
 -- always the option of doing nothing. Each activity contributes a few candidates; global rules
 -- drop targets in no-go areas, full places, blocked people and recent stuck spots; an interrupt
--- adds the reactions it suggests with a bonus.
+-- adds the reactions it suggests with a bonus. Newcomers (low familiarity) lean to exploring and
+-- aimless wandering, restless people pace and wander more, and a hangout with a free seat pulls
+-- a little harder on someone who likes to sit. Scoring lives in Utility, not here.
+-- requires: NavMath, Rng, Memory, Session, Mood, Utility
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -39,6 +42,9 @@ export type Poi = {
 	standOn: boolean?,
 }
 
+-- A structural view of Types.SeatRecord.
+export type Seat = { id: string, position: Vector3, poiId: string? }
+
 export type World = {
 	pois: { Poi },
 	poiOccupants: (poiId: string) -> number, -- entities inside the radius
@@ -56,6 +62,13 @@ export type World = {
 	isAvoided: (position: Vector3) -> boolean,
 	failedRecently: (target: string) -> boolean, -- a path to this target failed < 5 min ago
 	props: { { id: string, position: Vector3, top: number, footprint: number } }?,
+	-- Seats (optional; a world without them has no seats). The registry's seatsNear returns free
+	-- seats only, nearest first; occupySeat is false when the seat was taken meanwhile.
+	seats: { Seat }?,
+	seatsNear: ((position: Vector3, radius: number) -> { Seat })?,
+	occupySeat: ((seatId: string, who: string) -> boolean)?,
+	releaseSeat: ((seatId: string, who: string) -> ())?,
+	mood: string?, -- the brain's mood name, read by ReactProbe's reaction table
 }
 
 export type Context = {
@@ -72,6 +85,7 @@ export type Context = {
 	attachment: string?,
 	favoritePoiKind: string?,
 	fatigue: number,
+	familiarity: number?, -- persona.familiarity: Explore weight x (2 - familiarity); nil = no scaling
 }
 
 local function affinityFor(ctx: Context, id: string): number
@@ -158,6 +172,14 @@ local function visitPoiCandidates(out: { Candidate }, ctx: Context)
 		if ctx.phase == "orienting" and (poi.kind == "shop" or poi.kind == "spawn") then
 			factor *= 1.5
 		end
+		-- A hangout with a free seat pulls harder on someone who likes to sit.
+		local seatsNear = world.seatsNear
+		if poi.kind == "hangout" and seatsNear then
+			local sitHabit = ctx.persona.sitHabit or 0
+			if sitHabit > 0 and #seatsNear(poi.position, poi.radius) > 0 then
+				factor *= 1 + 0.3 * sitHabit
+			end
+		end
 		add(out, ctx, {
 			activity = "VisitPoi",
 			target = poi.id,
@@ -170,11 +192,20 @@ local function visitPoiCandidates(out: { Candidate }, ctx: Context)
 	end
 end
 
+-- Restlessness scales pacing and wandering: 0.6 .. 1.4, neutral for a persona without the trait.
+local function restless(ctx: Context): number
+	local r = ctx.persona.restlessness
+	return 0.6 + 0.8 * (if type(r) == "number" then r else 0.5)
+end
+
 local function exploreCandidates(out: { Candidate }, ctx: Context)
 	local world = ctx.world
 	if world.totalSectors > 0 and Memory.exploredCount(ctx.memory) >= 0.9 * world.totalSectors then
 		return
 	end
+	-- Newcomers explore twice as eagerly as someone who knows the platform (DR-35).
+	local familiarity = ctx.familiarity
+	local novice = if familiarity then 2 - math.clamp(familiarity, 0, 1) else 1
 	for _, sectorId in world.nearbySectors(ctx.me.position, 4) do
 		if Memory.isExplored(ctx.memory, sectorId) then
 			continue
@@ -187,7 +218,7 @@ local function exploreCandidates(out: { Candidate }, ctx: Context)
 				position = center,
 				distance = distanceTo(ctx, center),
 				data = { sectorId = sectorId, center = center },
-				ctx = 1 + 1.5 * (1 - ctx.persona.accountAge),
+				ctx = (1 + 1.5 * (1 - ctx.persona.accountAge)) * novice,
 				feasibility = feasibility(ctx, center, sectorId),
 			})
 		end
@@ -206,6 +237,16 @@ local function wanderCandidates(out: { Candidate }, ctx: Context)
 	if not toward and #world.pois > 0 then
 		toward = world.pois[ctx.rng:int(1, #world.pois)].position
 	end
+	-- Two goals: one biased toward someone or something, one nowhere in particular. Their weights
+	-- sum to 2.5; the persona's pointless share (already scaled by familiarity) splits it, and the
+	-- landed 1.5 / 1 split stands for a persona without the trait.
+	local pointless = ctx.persona.pointlessTarget
+	local biasedCtx, uniformCtx = 1.5, 1
+	if type(pointless) == "number" then
+		local share = math.clamp(pointless, 0, 1)
+		biasedCtx, uniformCtx = 2.5 * (1 - share), 2.5 * share
+	end
+	local restlessness = restless(ctx)
 	local biased = world.randomReachable(ctx.me.position, 15, 40, toward)
 	if biased then
 		add(out, ctx, {
@@ -213,7 +254,7 @@ local function wanderCandidates(out: { Candidate }, ctx: Context)
 			position = biased,
 			distance = distanceTo(ctx, biased),
 			data = { point = biased },
-			ctx = 1.5,
+			ctx = biasedCtx * restlessness,
 		})
 	end
 	local uniform = world.randomReachable(ctx.me.position, 15, 40, nil)
@@ -223,7 +264,7 @@ local function wanderCandidates(out: { Candidate }, ctx: Context)
 			position = uniform,
 			distance = distanceTo(ctx, uniform),
 			data = { point = uniform },
-			ctx = 1,
+			ctx = uniformCtx * restlessness,
 		})
 	end
 end
@@ -382,7 +423,11 @@ function Goals.candidates(ctx: Context, interrupt: any?): { Candidate }
 	end
 	if allowed("Pace") then
 		local someoneClose = #ctx.world.entities > 0 and distanceTo(ctx, ctx.world.entities[1].position) <= 8
-		add(out, ctx, { activity = "Pace", distance = 0, ctx = 1 + (if someoneClose then 0.5 else 0) })
+		add(out, ctx, {
+			activity = "Pace",
+			distance = 0,
+			ctx = (1 + (if someoneClose then 0.5 else 0)) * restless(ctx),
+		})
 	end
 	if allowed("StandOnProp") then
 		propCandidates(out, ctx)
@@ -459,6 +504,54 @@ function Goals.addReactions(out: { Candidate }, ctx: Context, ev: any)
 			if c.activity == "Follow" and c.target == subject then
 				c.bonus = (c.bonus or 0) + 1.5
 			end
+		end
+	elseif kind == "gameEvent" then
+		-- Something happened in the game: head for the nearest objective, or go and watch.
+		local data = ev.data or {}
+		local at: Vector3? = data.position
+		local origin: Vector3 = at or ctx.me.position
+		local nearest: Poi? = nil
+		local nearestD = math.huge
+		for _, poi in ctx.world.pois do
+			if poi.kind == "objective" then
+				local d = NavMath.flatDistance(origin, poi.position)
+				if d < nearestD then
+					nearest, nearestD = poi, d
+				end
+			end
+		end
+		if nearest then
+			local objective: Poi = nearest
+			local boosted = false
+			for _, c in out do
+				if c.activity == "VisitPoi" and c.target == objective.id then
+					c.bonus = (c.bonus or 0) + 2.0
+					boosted = true
+				end
+			end
+			if not boosted then
+				add(out, ctx, {
+					activity = "VisitPoi",
+					target = objective.id,
+					position = objective.position,
+					distance = distanceTo(ctx, objective.position),
+					data = objective,
+					ctx = objective.weight,
+					feasibility = feasibility(ctx, objective.position, objective.id),
+					bonus = 2.0,
+				})
+			end
+		end
+		if at then
+			add(out, ctx, {
+				activity = "Watch",
+				target = "event",
+				position = at,
+				distance = distanceTo(ctx, at),
+				data = { position = at },
+				bonus = 1.0,
+				feasibility = feasibility(ctx, at, nil),
+			})
 		end
 	end
 end

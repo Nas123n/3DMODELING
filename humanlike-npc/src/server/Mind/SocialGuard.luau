@@ -2,8 +2,10 @@
 -- The rules that keep an NPC from ever becoming a nuisance, enforced in the core where no
 -- adapter can bypass them: one follow episode per target, at most two unanswered direct
 -- messages, an immediate and permanent back-off on any "stop"-like message, a cap on verbal
--- reactions to probes, and never two spontaneous lines in a row at the same person. Relations
--- (affinity, annoyance) live here too so moods and utilities can read them.
+-- reactions to probes, and never two spontaneous lines in a row at the same person, and never a
+-- second rude line at the same person in a session. Relations (affinity, annoyance) live here
+-- too so moods and utilities can read them. This is not the reply decision (Chat/Reply).
+-- requires: Reply
 
 local Reply = require(script.Parent.Parent.Chat.Reply)
 
@@ -20,6 +22,7 @@ export type Relation = {
 	probeReplies: number, -- verbal reactions to probes this session
 	lastProbeReplyAt: { [string]: number }, -- per probe kind
 	lastDecayAt: number,
+	rudeAt: number?, -- when a rude line went to this person; set once, never cleared this session
 }
 
 export type Guard = typeof(setmetatable(
@@ -49,6 +52,7 @@ function SocialGuard.relation(self: Guard, id: string, now: number): Relation
 			probeReplies = 0,
 			lastProbeReplyAt = {},
 			lastDecayAt = now,
+			rudeAt = nil,
 		}
 		self.relations[id] = r
 	end
@@ -88,14 +92,24 @@ function SocialGuard.canDirectMessage(self: Guard, id: string, now: number): boo
 	return self.lastSpontaneousTarget ~= id
 end
 
--- Records a line said to a target (spontaneous or reply).
-function SocialGuard.saidTo(self: Guard, id: string, now: number, spontaneous: boolean)
+-- Records a line said to a target (spontaneous or reply); `rude` marks a rude corpus line, which
+-- this person then never gets again (see wasRudeTo).
+function SocialGuard.saidTo(self: Guard, id: string, now: number, spontaneous: boolean, rude: boolean?)
 	local r = self:relation(id, now)
 	r.unansweredDirect += 1
 	r.lastDirectAt = now
 	if spontaneous then
 		self.lastSpontaneousTarget = id
 	end
+	if rude then
+		r.rudeAt = now
+	end
+end
+
+-- True once a rude line was said to this person in this session.
+function SocialGuard.wasRudeTo(self: Guard, id: string): boolean
+	local r = self.relations[id]
+	return r ~= nil and r.rudeAt ~= nil
 end
 
 -- The target said something (anything): within a minute of my line it counts as an answer.

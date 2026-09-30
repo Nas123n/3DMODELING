@@ -676,6 +676,34 @@ return function(T, Loader)
 			T.equal(s.phase, "gone", "gone stays gone")
 		end)
 
+		T.it("shorten takes an optional distribution (a name collision leaves in 5..45 s)", function()
+			local p = persona(24, { sessionLength = 3600 })
+			local lows, highs = 0, 0
+			for seed = 1, 100 do
+				local s = Session.new(0, p, Rng.new(seed))
+				Session.shorten(s, 500, Rng.new(seed + 1000), 20, 0.4, 5, 45)
+				local left = s.leaveAt - 500
+				T.between(left, 5, 45, "LNc(20, 0.4, 5, 45)")
+				if left < 15 then
+					lows += 1
+				elseif left > 25 then
+					highs += 1
+				end
+			end
+			T.check(lows >= 5 and highs >= 5, `spread around 20 s (lows {lows}, highs {highs})`)
+			-- Partial parameters fall back to the landed defaults for the rest.
+			for seed = 1, 50 do
+				local s = Session.new(0, p, Rng.new(seed))
+				Session.shorten(s, 500, Rng.new(seed), 60)
+				T.between(s.leaveAt - 500, 20, 180, "defaults for spread and clamps")
+			end
+			-- The default call is byte-for-byte the landed one.
+			local a, b = Session.new(0, p, Rng.new(3)), Session.new(0, p, Rng.new(3))
+			Session.shorten(a, 500, Rng.new(9))
+			Session.shorten(b, 500, Rng.new(9), 60, 0.5, 20, 180)
+			T.equal(a.leaveAt, b.leaveAt)
+		end)
+
 		T.it("phaseWeight table spot checks", function()
 			T.equal(Session.phaseWeight("leaving", "Leave"), 50)
 			T.equal(Session.phaseWeight("joining", "Afk"), 0)

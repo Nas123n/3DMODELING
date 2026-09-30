@@ -5,7 +5,12 @@
 -- an echoed corpus line, a shadowed step), emoting, and fidgeting (jump bursts, shift-lock yaw
 -- sweeps, the abrupt wake after AFK). Each overlay returns at most one intent override and
 -- some actions; the activity's suppression flags are honoured so an AFK NPC stays dead still.
--- Echoes re-render corpus lines looked up by lineId: a player's bytes are never repeated.
+-- Echoes re-render corpus lines looked up by lineId: a player's bytes are never repeated. Two
+-- more small things a standing body does: a keyboard walker stops to read the chat window now
+-- and then, and anyone steps away from a stranger standing inside their personal space. Only
+-- shift-lock profiles ever turn in place; their camera style sets how often.
+-- requires: NavMath, Rng, Timing, JumpHabit, ChatCorpus, Composer, Reply, Recency, Safety, TypingFreeze,
+-- Mood, SocialGuard, Activities
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -64,7 +69,16 @@ export type Context = {
 	wakeBurst: boolean?,
 	fellNearby: boolean?,
 	poiWord: string?, -- the kind word of the POI the NPC stands at (or its PoiWord), for {poi} lines
+	platformFreezes: boolean?, -- false when this place's chat never takes the movement keys
+	reading: boolean?, -- senses:isReading(now): a keyboard walker may stop to read
+	nearest: Nearest?, -- the closest standing neighbour, for the step-away rule
+	knowsPoi: boolean?, -- help.right lines allowed (familiarity > 0.5 and the POI kind was visited)
+	interrupted: boolean?, -- a reaction interrupted the activity this step (half-typed lines drop)
 }
+
+-- The closest standing neighbour; dir is the unit vector from the NPC toward them; friend is
+-- true for the attachment, group members and anyone with real affinity (the caller decides).
+export type Nearest = { id: string, distance: number, dir: Vector3, friend: boolean }
 
 export type Output = {
 	intent: Intent?,
@@ -80,6 +94,7 @@ type Pending = {
 	category: string,
 	resumeAt: number,
 	isReply: boolean, -- an answer to a heard line: the guard lets replies past its share rules
+	rude: boolean, -- a rude corpus line: the guard records it so the target never gets a second one
 }
 
 export type State = typeof(setmetatable(
@@ -120,9 +135,20 @@ export type State = typeof(setmetatable(
 		yawUntil: number,
 		yawTarget: number?,
 		wasMoving: boolean,
+		lastRightAt: number, -- a "right"-tagged line at most once per 10 min
+		readingRolled: boolean, -- the reading pause was rolled for the current reading window
+		readFreezeUntil: number,
+		closeSince: number?, -- since when a stranger has stood inside the personal space
+		lastStepAwayAt: number,
+		lastActivity: string?, -- to notice the step a ReactProbe starts
 	},
 	Overlays
 ))
+
+local RIGHT_LINE_GAP = 600 -- seconds between two "right?" lines from one NPC
+local READ_PAUSE_KEYBOARD, READ_PAUSE_THUMBS = 0.3, 0.05 -- per reading window while walking
+local STEP_AWAY_AFTER, STEP_AWAY_GAP = 3, 8 -- seconds inside the space before a step; between steps
+local DROP_HALF_TYPED = 0.5 -- a half-typed line is abandoned on an interrupt with this chance
 
 local function u(rng: Rng, lo: number, hi: number): number
 	return rng:range(lo, hi)
@@ -130,6 +156,20 @@ end
 
 local function episodeGap(rng: Rng, chattiness: number): number
 	return rng:logNormalClamped(600, 0.9, 120, 3600) / (0.2 + chattiness * 2)
+end
+
+-- cameraStyle stretches or shortens the idle yaw sweep gap (shift-lock profiles only, the only
+-- ones that sweep): sweeper x0.7, locked x2.5 (and a smaller amplitude), twitchy x0.5.
+local function sweepGapScale(persona: any): number
+	local style = persona.cameraStyle
+	if style == "sweeper" then
+		return 0.7
+	elseif style == "locked" then
+		return 2.5
+	elseif style == "twitchy" then
+		return 0.5
+	end
+	return 1
 end
 
 function Overlays.new(rng: Rng, persona: any, now: number): State
@@ -151,7 +191,7 @@ function Overlays.new(rng: Rng, persona: any, now: number): State
 		interLo = 5,
 		interHi = 300,
 	}, now)
-	local nextYawAt = now + rng:logNormalClamped(6, 0.8, 2, 40)
+	local nextYawAt = now + rng:logNormalClamped(6, 0.8, 2, 40) * sweepGapScale(persona)
 	local typingRng = talkRng:fork("typing")
 	local self = setmetatable({
 		rng = rng,
@@ -176,35 +216,45 @@ function Overlays.new(rng: Rng, persona: any, now: number): State
 		yawUntil = 0,
 		yawTarget = nil,
 		wasMoving = false,
+		lastRightAt = -math.huge,
+		readingRolled = false,
+		readFreezeUntil = -math.huge,
+		closeSince = nil,
+		lastStepAwayAt = -math.huge,
+		lastActivity = nil,
 	}, Overlays)
 	return self
 end
 
--- Queues a line for sending after its typing time. The body follows a TypingFreeze plan until
--- the pinned resume moment after the line is said; the indicator action follows with the tick.
+-- Queues a composed line for sending after its typing time. The body follows a TypingFreeze
+-- plan until the pinned resume moment after the line is said; the indicator action follows
+-- with the tick. A "right"-tagged line starts the NPC's 10 min timer for the next one.
 local function schedule(
 	self: State,
 	ctx: Context,
-	text: string,
-	lineId: string,
-	category: string,
+	composed: Composer.Composed,
 	target: string?,
 	addressed: boolean,
 	isReply: boolean?
 )
 	local rng = self.rng
+	local text = composed.text
 	local latency = Reply.latency(text, self.persona.voice, rng, addressed)
 	local at = ctx.now + latency
 	local plan = TypingFreeze.plan(self.typingRng, self.persona.profile.kind, ctx.moving, latency, ctx.me.heading)
 	self.pending = {
 		at = at,
 		text = text,
-		lineId = lineId,
+		lineId = composed.lineId,
 		target = target,
-		category = category,
+		category = composed.category,
 		resumeAt = at + u(rng, 0.5, 2.0),
 		isReply = isReply == true,
+		rude = composed.rude == true,
 	}
+	if composed.right then
+		self.lastRightAt = ctx.now
+	end
 	self.freezeUntil = (self.pending :: Pending).resumeAt
 	self.freezeVariant = if plan.variant == "heldKey" then "walkStraight" else plan.variant
 	-- The freeze ends at resumeAt (pinned); the plan only says how the body waits until then.
@@ -252,6 +302,18 @@ local function echoSource(lineId: any): string?
 	return source
 end
 
+-- Rude corpus lines: only for a persona with the rudeness cap open (trolliness at 0.6 or more),
+-- never in a social mood, and never twice at the same person.
+local function rudeAllowed(self: State, ctx: Context, target: string?): boolean
+	local p = self.persona
+	local cap = p.rudenessCap
+	local open = if type(cap) == "number" then cap == 1 else p.trolliness > 0.6
+	if not open or ctx.mood == "social" then
+		return false
+	end
+	return target == nil or not ctx.guard:wasRudeTo(target)
+end
+
 local function compose(self: State, ctx: Context, category: string?, target: string?, echo: string?): Composer.Composed?
 	local targetName = if target then (ctx.entity(target) or {}).displayName else nil
 	return Composer.compose({
@@ -266,8 +328,11 @@ local function compose(self: State, ctx: Context, category: string?, target: str
 		trolliness = self.persona.trolliness,
 		nearbyName = targetName or ctx.nearbyName,
 		echoSource = echo,
-		allowRude = self.persona.trolliness > 0.6 and ctx.mood ~= "social",
+		allowRude = rudeAllowed(self, ctx, target),
 		poiWord = ctx.poiWord,
+		dialect = self.persona.dialect,
+		allowRight = ctx.now - self.lastRightAt >= RIGHT_LINE_GAP,
+		knowsPoi = ctx.knowsPoi == true,
 	}, ctx.chat.recency, ctx.chat.safety)
 end
 
@@ -282,7 +347,7 @@ function Overlays.forceLine(self: State, ctx: Context, category: string, target:
 	local composed = compose(self, ctx, category, target, nil)
 	if composed then
 		-- A probe answer replies to something heard; other forced lines are the NPC's own.
-		schedule(self, ctx, composed.text, composed.lineId, composed.category, target, true, category == "probe")
+		schedule(self, ctx, composed, target, true, category == "probe")
 	end
 end
 
@@ -325,22 +390,22 @@ local function onHeard(self: State, ctx: Context, ev: any)
 	end
 	local composed = compose(self, ctx, category, fromId, nil)
 	if composed then
-		schedule(
-			self,
-			ctx,
-			composed.text,
-			composed.lineId,
-			composed.category,
-			fromId,
-			classified.named or classified.kind ~= "broadcast",
-			true
-		)
+		schedule(self, ctx, composed, fromId, classified.named or classified.kind ~= "broadcast", true)
 	end
 end
 
 local function tickTalk(self: State, ctx: Context, out: Output)
 	local rng = self.rng
 	local p = self.persona
+	-- A line still being typed when a reaction interrupts (or a ReactProbe starts) is abandoned
+	-- half the time: people drop half-typed messages when something happens (§6.3).
+	local interrupted = ctx.interrupted == true or (ctx.activity == "ReactProbe" and self.lastActivity ~= "ReactProbe")
+	self.lastActivity = ctx.activity
+	if interrupted and self.pending and rng:chance(DROP_HALF_TYPED) then
+		self.pending = nil
+		self.freezeUntil = -math.huge
+		self.typingPlan = nil
+	end
 	for _, ev in ctx.events do
 		if ev.kind == "chatHeard" or ev.kind == "chatAddressed" then
 			onHeard(self, ctx, ev)
@@ -358,29 +423,30 @@ local function tickTalk(self: State, ctx: Context, out: Output)
 			)
 			ctx.chat.safety:record(ctx.me.id, pending.lineId, pending.text, ctx.now, pending.target)
 			if pending.target then
-				ctx.guard:saidTo(pending.target, ctx.now, pending.category ~= "probe")
+				ctx.guard:saidTo(pending.target, ctx.now, pending.category ~= "probe", pending.rude)
 			end
 			self.lastLineAt = ctx.now
 			-- Tagged lines sometimes get the "tags" follow-up; other lines a fragment follow-up.
 			if string.match(pending.text, "^[# ]+$") and rng:chance(0.4) then
 				local follow = compose(self, ctx, "tagged", nil, nil)
 				if follow then
-					schedule(self, ctx, follow.text, follow.lineId, follow.category, nil, true)
+					schedule(self, ctx, follow, nil, true)
 				end
 			elseif rng:chance(0.25) and pending.category ~= "leaving" then
 				local follow = compose(self, ctx, pending.category, pending.target, nil)
 				if follow then
-					schedule(self, ctx, follow.text, follow.lineId, follow.category, pending.target, true)
+					schedule(self, ctx, follow, pending.target, true)
 				end
 			end
 		end
 	end
 
-	-- Typing freeze: the plan drawn when the line was scheduled says how the body waits.
+	-- Typing freeze: the plan drawn when the line was scheduled says how the body waits. A place
+	-- whose chat never takes the movement keys (platformFreezes false) has no freeze at all.
 	if ctx.now < self.freezeUntil then
 		out.typing = true
 		local plan = self.typingPlan
-		if p.profile.typingFreezes and plan then
+		if p.profile.typingFreezes and ctx.platformFreezes ~= false and plan then
 			local intent = TypingFreeze.intent(plan, ctx.now)
 			if intent then
 				intent.duration = self.freezeUntil - ctx.now
@@ -416,7 +482,7 @@ local function tickTalk(self: State, ctx: Context, out: Output)
 			end
 			local composed = compose(self, ctx, nil, target, nil)
 			if composed then
-				schedule(self, ctx, composed.text, composed.lineId, composed.category, target, false)
+				schedule(self, ctx, composed, target, false)
 			end
 		end
 	end
@@ -507,7 +573,7 @@ local function tickMirror(self: State, ctx: Context, out: Output)
 		elseif m.kind == "echo" and not self.pending and not ctx.suppress.talk then
 			local composed = compose(self, ctx, "echo", nil, m.echo)
 			if composed then
-				schedule(self, ctx, composed.text, composed.lineId, "echo", nil, true)
+				schedule(self, ctx, composed, nil, true)
 			end
 		elseif m.kind == "step" and not out.intent then
 			out.intent = { kind = "step", dir = m.dir, duration = u(rng, 0.3, 0.8) }
@@ -562,8 +628,27 @@ local function tickFidget(self: State, ctx: Context, out: Output)
 		end
 		return
 	end
+	-- Reading pause (DR-21): a walker who is reading the chat window stops for a moment, rolled
+	-- once per reading window; keyboards far more often than thumbs. The runtime counts the
+	-- "look" action as readingPause.
+	local reading = ctx.reading == true
+	if reading and ctx.moving and not self.readingRolled then
+		self.readingRolled = true
+		local kind = p.profile.kind
+		local chance = if kind == "pc" or kind == "pcShiftLock" then READ_PAUSE_KEYBOARD else READ_PAUSE_THUMBS
+		if rng:chance(chance) then
+			self.readFreezeUntil = ctx.now + rng:logNormalClamped(2, 0.5, 1, 4)
+			table.insert(out.actions, { kind = "look", name = "readingPause" })
+		end
+	elseif not reading then
+		self.readingRolled = false
+	end
+	local readingFreeze = ctx.now < self.readFreezeUntil
+	if readingFreeze and not out.intent then
+		out.intent = { kind = "freeze", variant = "still", duration = self.readFreezeUntil - ctx.now }
+	end
 	local contextMul = if ctx.playersWithin30 >= 1 then 1 else 0.6
-	local typing = out.typing
+	local typing = out.typing or readingFreeze
 	if self.jumpHabit:poll(ctx.now, ctx.moving, ctx.onGround, typing) and rng:chance(contextMul) then
 		if not out.intent then
 			out.intent = { kind = "jump" }
@@ -573,16 +658,18 @@ local function tickFidget(self: State, ctx: Context, out: Output)
 			end
 		end
 	end
-	-- Shift-lock yaw sweeps while idle and bored or social.
+	-- Shift-lock yaw sweeps while idle and bored or social; the camera style sets the gap (and a
+	-- locked camera barely moves).
 	if
 		p.profile.strafes
 		and not ctx.moving
 		and (ctx.mood == "bored" or ctx.mood == "social")
 		and ctx.now >= self.nextYawAt
 	then
-		self.yawTarget = NavMath.yawOf(ctx.me.heading) + math.rad(u(rng, 10, 60)) * rng:sign()
+		local amplitude = if p.cameraStyle == "locked" then u(rng, 5, 25) else u(rng, 10, 60)
+		self.yawTarget = NavMath.yawOf(ctx.me.heading) + math.rad(amplitude) * rng:sign()
 		self.yawUntil = ctx.now + u(rng, 0.5, 2)
-		self.nextYawAt = ctx.now + rng:logNormalClamped(6, 0.8, 2, 40)
+		self.nextYawAt = ctx.now + rng:logNormalClamped(6, 0.8, 2, 40) * sweepGapScale(p)
 	end
 	if self.yawTarget and ctx.now < self.yawUntil and not out.intent then
 		out.intent = { kind = "face", yaw = self.yawTarget }
@@ -591,12 +678,46 @@ local function tickFidget(self: State, ctx: Context, out: Output)
 	end
 end
 
--- Runs all overlays in order: talk (may freeze), mirror, emote, fidget.
+-- Step-away (DR-17): a stranger standing inside the personal space for a few seconds while the
+-- NPC stands gets one short step directly away, at most once every few seconds. Friends (the
+-- attachment, group members, anyone the caller marks) may stand close.
+local function tickStepAway(self: State, ctx: Context, out: Output)
+	local n = ctx.nearest
+	local space = self.persona.personalSpace
+	if
+		n == nil
+		or type(space) ~= "number"
+		or ctx.moving
+		or ctx.suppress.fidget
+		or n.friend
+		or ctx.groupMembers[n.id]
+		or ctx.attachment == n.id
+		or n.distance >= space
+	then
+		self.closeSince = nil
+		return
+	end
+	local since = self.closeSince or ctx.now
+	self.closeSince = since
+	if ctx.now - since < STEP_AWAY_AFTER or ctx.now - self.lastStepAwayAt < STEP_AWAY_GAP or out.intent then
+		return
+	end
+	local away = -NavMath.flat(n.dir)
+	if away.Magnitude < 1e-6 then
+		return
+	end
+	self.lastStepAwayAt = ctx.now
+	local studs = u(self.rng, 1, 2)
+	out.intent = { kind = "step", dir = away.Unit, duration = studs / (self.persona.walkSpeed or 16) }
+end
+
+-- Runs all overlays in order: talk (may freeze), mirror, emote, step-away, fidget.
 function Overlays.tick(self: State, ctx: Context): Output
 	local out: Output = { intent = nil, actions = {}, typing = false }
 	tickTalk(self, ctx, out)
 	tickMirror(self, ctx, out)
 	tickEmote(self, ctx, out)
+	tickStepAway(self, ctx, out)
 	tickFidget(self, ctx, out)
 	self.wasMoving = ctx.moving
 	-- The typing indicator brackets every line: on once a line is queued, off once it was said

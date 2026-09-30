@@ -5,6 +5,7 @@
 -- Roblox adapter and every Lune fake implements one of these shapes; the core only ever sees the
 -- shape. Types only: no functions, no state, no instance API. It requires Types and World/Spatial
 -- (for the Group type) and nothing else.
+-- requires: Spatial, Types
 
 local Types = require(script.Parent.Types)
 local Spatial = require(script.Parent.World.Spatial)

@@ -9,11 +9,16 @@
 -- PC players enter far more often than mobile players and that grows with chat volume. The social
 -- detectors run over the same near list: being followed, blocked, stared at, stood on, bumped
 -- into and a fresh group nearby, each with its own dwell condition and per-subject cooldown so a
--- single stimulus never spams the queue. Pure: injected now and dt, seeded rng, no instance API.
+-- single stimulus never spams the queue. With attention off (a fully AFK NPC) sightings are still
+-- recorded but nothing is reported except a line that names the NPC: an AFK player does not
+-- notice a follower, but does notice their name. Pure: injected now and dt, seeded rng, no
+-- instance API.
+-- requires: NavMath, Rng, Spatial, Memory, Personality, Reaction, Reply
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
 local Spatial = require(script.Parent.Parent.World.Spatial)
+local Reply = require(script.Parent.Parent.Chat.Reply)
 local Memory = require(script.Parent.Memory)
 local Personality = require(script.Parent.Personality)
 local Reaction = require(script.Parent.Reaction)
@@ -30,10 +35,23 @@ Senses.__index = Senses
 -- Raw events for Reaction.push (§4.6.4), which adds the delay and the chance of missing them.
 export type Event = Reaction.Event
 
-export type Chat = { fromId: string, text: string, position: Vector3, at: number }
+-- A heard line; lineId is the corpus id when an NPC said it (Types.ChatEvent.lineId), so the
+-- brain can echo corpus lines and never a player's bytes.
+export type Chat = { fromId: string, text: string, position: Vector3, at: number, lineId: string? }
+
+-- The NPC itself; the names are only needed to recognise a line aimed at it while attention is off.
+export type Me = {
+	id: string,
+	position: Vector3,
+	heading: Vector3,
+	moving: boolean,
+	velocity: Vector3,
+	displayName: string?,
+	username: string?,
+}
 
 export type SenseInput = {
-	me: { id: string, position: Vector3, heading: Vector3, moving: boolean, velocity: Vector3 },
+	me: Me,
 	entities: { Entity }, -- near me, excluding me
 	chats: { Chat },
 	groups: { Group },
@@ -42,6 +60,8 @@ export type SenseInput = {
 	occlusion: ((from: Vector3, to: Vector3) -> boolean)?, -- true when the line of sight is blocked
 	raycastBudget: number?, -- occlusion calls allowed this step; nil = unlimited
 	locomotion: { blockedBy: string?, velocityJump: number? }?,
+	-- The brain's suppress.attention (a full AFK): record sightings, report only lines naming me.
+	attentionOff: boolean?,
 }
 
 type Trail = { since: number, moved: number }
@@ -202,14 +222,32 @@ local function prune(self: Senses, present: { [string]: boolean }, now: number)
 	end
 end
 
+-- Whether a heard line names the NPC (Reply's rule), given the names are known.
+local function namesMe(me: Me, text: string): boolean
+	local displayName, username = me.displayName, me.username
+	if displayName == nil or username == nil then
+		return false
+	end
+	return Reply.isNamed(Reply.normalize(text), displayName, username)
+end
+
 function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachmentId: string?): { Event }
 	local now, me = input.now, input.me
+	local attentive = input.attentionOff ~= true
 	local events: { Event } = {}
 	local function emit(kind: string, salience: number, subject: string?, expected: boolean?, data: any?)
-		table.insert(
-			events,
-			{ kind = kind, salience = salience, expected = expected, subject = subject, at = now, data = data }
-		)
+		if not attentive and kind ~= "chatHeard" then
+			return
+		end
+		local event: Event = {
+			kind = kind :: string,
+			salience = salience,
+			expected = expected,
+			subject = subject,
+			at = now,
+			data = data,
+		}
+		table.insert(events, event)
 	end
 
 	local moved = if self.lastPosition then (me.position - self.lastPosition).Magnitude else 0
@@ -291,7 +329,8 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 
 		-- followed: behind me and close, continuously, while I actually go somewhere
 		if
-			dist <= FOLLOW_RANGE
+			attentive
+			and dist <= FOLLOW_RANGE
 			and flatDir ~= Vector3.zero
 			and heading ~= Vector3.zero
 			and facing < FOLLOW_BEHIND_DOT
@@ -315,7 +354,7 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 
 		-- stared: standing still at a conversational distance, facing me
 		local staring = false
-		if e.velocity.Magnitude < STARE_SPEED and dist >= STARE_MIN and dist <= STARE_MAX then
+		if attentive and e.velocity.Magnitude < STARE_SPEED and dist >= STARE_MIN and dist <= STARE_MAX then
 			local theirLook = NavMath.dirFromYaw(e.yaw)
 			staring = theirLook:Dot(-flatDir) > STARE_DOT
 		end
@@ -336,7 +375,7 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 
 		-- onHead: right above me for a second
 		local dy = e.position.Y - me.position.Y
-		if dy >= ONHEAD_MIN_DY and dy <= ONHEAD_MAX_DY and flatTo.Magnitude < ONHEAD_RADIUS then
+		if attentive and dy >= ONHEAD_MIN_DY and dy <= ONHEAD_MAX_DY and flatTo.Magnitude < ONHEAD_RADIUS then
 			local since = self.onHeadSince[e.id]
 			if since == nil then
 				since = now
@@ -375,7 +414,7 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 	end
 
 	local locomotion = input.locomotion
-	if locomotion then
+	if locomotion and attentive then
 		local blockedBy = locomotion.blockedBy
 		if blockedBy and not onCooldown(self, `blocked:{blockedBy}`, now) then
 			self.cooldowns[`blocked:{blockedBy}`] = now + BLOCKED_COOLDOWN
@@ -398,6 +437,9 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 	end
 
 	for _, group in input.groups do
+		if not attentive then
+			break
+		end
 		if self.groupsSeen[group.id] or #group.members < GROUP_MIN_SIZE or now - group.createdAt > GROUP_FRESH then
 			continue
 		end
@@ -415,20 +457,25 @@ function Senses.step(self: Senses, input: SenseInput, memory: Memory, attachment
 		end
 		local distance = (chat.position - me.position).Magnitude
 		if distance <= HEAR_RANGE or reading then
+			-- With attention off only a line that names me gets through.
+			local named = namesMe(me, chat.text)
+			if not attentive and not named then
+				continue
+			end
 			table.insert(self.chatTimes, now)
-			emit(
-				"chatHeard",
-				0.25,
-				chat.fromId,
-				nil,
-				{ text = chat.text, position = chat.position, distance = distance }
-			)
+			emit("chatHeard", 0.25, chat.fromId, nil, {
+				text = chat.text,
+				position = chat.position,
+				distance = distance,
+				lineId = chat.lineId,
+				named = named,
+			})
 		end
 	end
 	pruneTimes(self.chatTimes, now - CHAT_VOLUME_WINDOW)
 
 	-- Reading window: a Poisson process whose rate depends on the input device and on chat volume.
-	if not reading then
+	if not reading and attentive then
 		local kind = self.persona.profile.kind
 		local rate = if kind == "pc" or kind == "pcShiftLock" then READ_RATE_PC else READ_RATE_MOBILE
 		local volume = countSince(self.chatTimes, now - CHAT_VOLUME_WINDOW)

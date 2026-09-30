@@ -3,6 +3,11 @@
 -- whatever the nav grid says the floor is, and refuses to enter blocked cells (which is what
 -- pushing a wall looks like: intent but no motion). It is deliberately crude: it exists to
 -- exercise state machines, not to imitate physics.
+--
+-- `moveTo` commands walk toward the point at full magnitude and raise `moveToFinished` in the
+-- reported state once within 1 stud (cleared by a new target or by any move/stop command).
+-- `walkSpeed` is a plain field a test may write (or call `setWalkSpeed`), and `fling(velocity)`
+-- overrides the next step's motion with that velocity, the way a physics shove would.
 
 local roblox = require("@lune/roblox")
 local Vector3 = roblox.Vector3
@@ -41,6 +46,11 @@ function Sim.new(position: any, options: Options?)
 		lastCommand = nil,
 		jumps = 0,
 		distance = 0,
+		-- moveTo bookkeeping: the current target and whether the body has reached it.
+		moveToPoint = nil,
+		moveToFinished = nil,
+		-- A velocity that replaces the next step's horizontal motion (see `fling`).
+		velocityOverride = nil,
 	}, Sim)
 end
 
@@ -53,7 +63,23 @@ function Sim.state(self)
 		state = if self.onGround then "Running" else "Freefall",
 		walkSpeed = self.walkSpeed,
 		yaw = self.yaw,
+		moveToFinished = self.moveToFinished,
 	}
+end
+
+-- Writable walk speed (the field itself may also be assigned directly).
+function Sim.setWalkSpeed(self, speed: number)
+	self.walkSpeed = speed
+end
+
+-- Shoves the body: it reports `velocity` at once, leaves the ground with the vertical part, and
+-- the next step moves it by the horizontal part regardless of the command (then physics resume:
+-- momentum carries through the air, gravity brings it down onto whatever floor is there).
+function Sim.fling(self, velocity: any)
+	self.velocity = velocity
+	self.velocityOverride = velocity
+	self.onGround = false
+	self.verticalSpeed = velocity.Y
 end
 
 -- Applies a MoveCommand for dt seconds.
@@ -65,11 +91,22 @@ function Sim.step(self, command, dt: number)
 		dir = command.dir
 		magnitude = command.magnitude
 	elseif command.mode == "moveTo" and command.moveToPoint then
+		if command.moveToPoint ~= self.moveToPoint then
+			self.moveToPoint = command.moveToPoint
+			self.moveToFinished = false
+		end
 		local d = Vector3.new(command.moveToPoint.X - self.position.X, 0, command.moveToPoint.Z - self.position.Z)
 		if d.Magnitude > 1 then
 			dir = d.Unit
 			magnitude = 1
+		else
+			self.moveToFinished = true
 		end
+	end
+	if command.mode ~= "moveTo" then
+		-- Like Humanoid:Move after MoveTo: the pending MoveTo is dropped.
+		self.moveToPoint = nil
+		self.moveToFinished = nil
 	end
 	if command.jump and self.onGround then
 		self.onGround = false
@@ -85,6 +122,11 @@ function Sim.step(self, command, dt: number)
 		-- Momentum carries through the air; input only nudges it (Roblox's limited air control).
 		local carried = Vector3.new(self.velocity.X, 0, self.velocity.Z)
 		horizontal = carried:Lerp(horizontal, 0.15)
+	end
+	local override = self.velocityOverride
+	if override then
+		horizontal = Vector3.new(override.X, 0, override.Z)
+		self.velocityOverride = nil
 	end
 	local nextX = self.position.X + horizontal.X * dt
 	local nextZ = self.position.Z + horizontal.Z * dt

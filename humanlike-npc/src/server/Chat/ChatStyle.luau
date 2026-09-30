@@ -7,6 +7,7 @@
 --
 -- The typing-time model (notice + open the box + characters / speed + hesitation) is here too,
 -- because a reply that arrives faster than it could have been typed is the loudest chat tell.
+-- requires: Rng
 
 local Rng = require(script.Parent.Parent.Rng)
 

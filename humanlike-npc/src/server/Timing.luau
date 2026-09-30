@@ -3,6 +3,7 @@
 -- delay that has a long tail, act in bursts separated by heavy-tailed gaps, and drift rather
 -- than jitter. Everything here draws from a seeded Rng and an injected `now`, so it is exact in
 -- tests and deterministic per NPC.
+-- requires: Rng
 
 local Rng = require(script.Parent.Rng)
 

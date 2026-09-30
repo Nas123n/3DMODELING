@@ -15,6 +15,7 @@
 -- Scripted no-progress moments (a deliberate wall bump, a pause, an about-face) suppress it for a
 -- bounded time and clear the direction history, so a humanizer's own reversal never counts.
 -- It only ever sees plain numbers and vectors; the caller decides what to do with a verdict.
+-- requires: NavMath, Types
 
 local NavMath = require(script.Parent.NavMath)
 local Types = require(script.Parent.Parent.Types)

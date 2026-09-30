@@ -1,6 +1,7 @@
 --!strict
 -- Small vector helpers the navigation modules share: flattening to the XZ plane, yaw <-> direction,
 -- angle wrapping. Kept out of the modules so their logic reads as the algorithm, not as geometry.
+-- requires: (none)
 
 local NavMath = {}
 

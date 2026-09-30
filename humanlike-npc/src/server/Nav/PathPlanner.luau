@@ -13,6 +13,7 @@
 -- off and the grid backlog is long, far-tier requests are answered at once with a straight line
 -- or NoPath ("shed") so near NPCs keep their latency. It never yields and never touches a Roblox
 -- service: providers are injected, time is passed in.
+-- requires: GoalResolver, NavMath, Types
 
 local NavMath = require(script.Parent.NavMath)
 local GoalResolver = require(script.Parent.GoalResolver)

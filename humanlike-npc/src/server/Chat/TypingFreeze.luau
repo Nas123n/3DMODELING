@@ -6,6 +6,7 @@
 -- into a freeze intent for the locomotion runtime. It reads no clock, touches no body and does
 -- not decide when the line is said or whether the typing indicator shows: Mind/Overlays owns
 -- the schedule, the end of the freeze and the indicator action.
+-- requires: Activities, Rng
 
 local Rng = require(script.Parent.Parent.Rng)
 local Activities = require(script.Parent.Parent.Mind.Activities)

@@ -13,6 +13,7 @@
 --
 -- This module is pure: it reads no clock, no world and no Config (tunables such as the R6 share
 -- arrive through Options), and it decides nothing about behaviour; it only describes a person.
+-- requires: ChatStyle, InputProfile, Rng
 
 local Rng = require(script.Parent.Parent.Rng)
 local InputProfile = require(script.Parent.Parent.Human.InputProfile)

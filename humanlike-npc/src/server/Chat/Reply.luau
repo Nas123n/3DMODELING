@@ -4,6 +4,7 @@
 -- name in it by a third, a question by those who feel helpful, an offer by many (with
 -- suspicion, never acceptance), and "are you a bot" by most, once. A reply arrives no sooner
 -- than it could have been noticed, the chat box opened, and the words typed.
+-- requires: ChatStyle, Rng
 
 local ChatStyle = require(script.Parent.ChatStyle)
 local Rng = require(script.Parent.Parent.Rng)

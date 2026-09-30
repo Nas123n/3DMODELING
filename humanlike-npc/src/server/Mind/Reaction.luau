@@ -6,6 +6,7 @@
 -- floor and 2.5x longer for surprises. System events (stuck, fell, path failed, stop keyword)
 -- carry salience >= 0.95, are never missed and fire at once. Events wait in a queue sorted by
 -- their due time so the brain pops them in order.
+-- requires: Mood, Personality, Rng
 
 local Mood = require(script.Parent.Mood)
 local Personality = require(script.Parent.Personality)

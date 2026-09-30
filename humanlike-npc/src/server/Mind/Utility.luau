@@ -4,7 +4,10 @@
 -- appetite, how much it would relieve current needs, the session phase, the mood, a context
 -- factor, distance, how recently the same thing was done, affinity toward the target and
 -- feasibility. Selection is soft (a temperature set by impulsivity) with hysteresis so a running
--- activity is only dropped for something clearly better.
+-- activity is only dropped for something clearly better. Going AFK is need-driven only through
+-- fatigue (0.5 + 0.5 fatigue) so it is reachable inside an ordinary session. Candidate lists
+-- come from Goals, not from here.
+-- requires: Rng, Session, Mood
 
 local Rng = require(script.Parent.Parent.Rng)
 local Session = require(script.Parent.Session)
@@ -78,7 +81,6 @@ end
 local SATISFIES: { [string]: { boredom: number?, social: number?, purpose: number?, fatigue: number?, novelty: number? } } =
 	{
 		IdleStand = { fatigue = 0.6, boredom = -0.2 },
-		Afk = { fatigue = 1.4 },
 		VisitPoi = { purpose = 1.0, boredom = 0.4 },
 		Explore = { novelty = 1.0, boredom = 0.5, purpose = 0.2 },
 		Wander = { boredom = 0.5, novelty = 0.3 },
@@ -96,6 +98,9 @@ local SATISFIES: { [string]: { boredom: number?, social: number?, purpose: numbe
 function Utility.need(activity: string, needs: NeedsTable): number
 	if activity == "ReactProbe" or activity == "Leave" then
 		return 1 -- reactions and leaving are not need-driven
+	elseif activity == "Afk" then
+		-- Half the appetite is always there; fatigue adds the rest (D-41).
+		return 0.5 + 0.5 * needs.fatigue
 	end
 	local row: { [string]: number } = SATISFIES[activity] or {}
 	-- People stand around regardless of needs; idling never competes from the floor.
@@ -224,6 +229,7 @@ function Utility.sensitivity(kind: string, persona: any): number
 		or kind == "stopKeyword"
 		or kind == "flung"
 		or kind == "blocked"
+		or kind == "gameEvent"
 	then
 		return 2.0
 	end

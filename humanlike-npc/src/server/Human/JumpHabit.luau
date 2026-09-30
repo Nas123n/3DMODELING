@@ -4,6 +4,7 @@
 -- tier; bursts come from a bursty process whose rhythm is pinned by airtime; the rate follows
 -- mood; keyboard players cannot jump while typing; and a jump seen nearby is sometimes copied a
 -- second or two later (the mirroring that made BotPrize bots read as human).
+-- requires: InputProfile, Rng, Timing
 
 local Rng = require(script.Parent.Parent.Rng)
 local Timing = require(script.Parent.Parent.Timing)

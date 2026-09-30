@@ -6,6 +6,7 @@
 -- carries an annoyance level that probes raise and a 180 s time constant drains. The multiplier
 -- table is the single place that says how each mood skews fidgeting, chat, emotes, mirroring,
 -- reaction delay, interrupt sensitivity, need drift and activity utilities.
+-- requires: Needs, Personality, Rng
 
 local Needs = require(script.Parent.Needs)
 local Personality = require(script.Parent.Personality)

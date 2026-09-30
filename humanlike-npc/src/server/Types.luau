@@ -2,6 +2,7 @@
 -- Plain-data contracts shared by the pure core and the Roblox adapters. No functions, no
 -- instances: every value here can be built in a test from literals, which is what keeps the
 -- brain, the navigation runtime and the humanizer testable under Lune.
+-- requires: (none)
 
 export type WaypointAction = "Walk" | "Jump" | "Custom"
 
@@ -85,6 +86,7 @@ export type PoiRecord = {
 	radius: number,
 	dwellMedian: number?,
 	capacity: number?, -- NpcCapacity attribute; nil = unlimited
+	word: string?, -- PoiWord attribute: overrides the {poi} chat word (else the kind is used)
 	source: any?, -- the Instance (adapter only; nil in tests)
 }
 

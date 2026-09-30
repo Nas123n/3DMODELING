@@ -7,6 +7,7 @@
 -- brain, not the humanizer and not the mover: it knows nothing about chat, tiers or personas, and
 -- the owner (Runtime/Npc) wires senses -> brain -> setIntent -> tick -> humanizer -> mover. Pure:
 -- time is injected, every draw comes from the Rng it is given, the body is a table.
+-- requires: Activities, NavMath, PathPlanner, Recovery, Rng, Steering, StuckDetector, Types, WaypointFollower
 
 local Rng = require(script.Parent.Parent.Rng)
 local Types = require(script.Parent.Parent.Types)

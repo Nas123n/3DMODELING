@@ -522,5 +522,97 @@ return function(T, Loader)
 			T.equal(#step(6, { group(1, 3, 20, 4) }), 0, "once per id")
 			T.equal(#step(7, { group(5, 3, 30, 6), group(1, 3, 20, 4) }), 1, "a new id")
 		end)
+
+		T.it("chatHeard carries the line id of a corpus line and marks lines naming me", function()
+			local senses, memory = make(21)
+			local who = me(0, 0)
+			who.displayName = "Milo"
+			who.username = "milo_plays"
+			local chats = {
+				{ fromId = "n:npc2", text = "lol", position = Vector3.new(5, 0, 0), at = 0, lineId = "reaction:lol" },
+				{ fromId = "p1", text = "milo come here", position = Vector3.new(5, 0, 0), at = 0 },
+			}
+			local heard = only(senses:step(input(who, {}, 0, 0.1, { chats = chats }), memory), "chatHeard")
+			T.equal(#heard, 2)
+			T.equal(heard[1].data.lineId, "reaction:lol")
+			T.equal(heard[1].data.named, false)
+			T.equal(heard[2].data.lineId, nil, "a player's line has no corpus id")
+			T.equal(heard[2].data.named, true)
+			T.equal(heard[2].data.text, "milo come here")
+		end)
+
+		T.it("attentionOff drops everything but named lines", function()
+			local function scene(attentionOff)
+				local senses, memory = make(22)
+				local who = me(0, 0)
+				who.displayName = "Milo"
+				who.username = "milo_plays"
+				local starer = entity("s", 0, 0, -4, { yaw = math.pi }) -- still, facing me, 4 studs
+				local jumper = entity("j", 3, 0, -6, { jumpedAt = 0 })
+				local rider = entity("r", 0.5, 5, 0)
+				local kinds = {}
+				local dt = 0.5
+				for i = 0, 12 do
+					local t = i * dt
+					jumper.jumpedAt = t
+					local chats = if i == 4
+						then {
+							{ fromId = "p1", text = "hi everyone", position = Vector3.new(5, 0, 0), at = t },
+							{ fromId = "p1", text = "hey milo u there", position = Vector3.new(5, 0, 0), at = t },
+						}
+						else {}
+					local groups = {
+						{
+							id = 9,
+							members = { "a", "b", "c" },
+							center = Vector3.new(10, 0, 0),
+							radius = 4,
+							age = 0,
+							createdAt = t,
+						},
+					}
+					local out = senses:step(
+						input(who, { starer, jumper, rider }, t, dt, {
+							chats = chats,
+							groups = groups,
+							attentionOff = attentionOff,
+							locomotion = { blockedBy = "s", velocityJump = 8 },
+						}),
+						memory
+					)
+					for _, ev in out do
+						kinds[ev.kind] = (kinds[ev.kind] or 0) + 1
+						if attentionOff then
+							T.equal(ev.kind, "chatHeard", `leaked {ev.kind}`)
+							T.equal(ev.data.text, "hey milo u there", "only the line naming me")
+							T.equal(ev.data.named, true)
+						end
+					end
+				end
+				return kinds, senses, memory
+			end
+			local attentive = scene(false)
+			T.check((attentive.entityAppeared or 0) >= 3, "the scene is noisy when attentive")
+			T.check((attentive.stared or 0) >= 1, "stared fires when attentive")
+			T.check((attentive.onHead or 0) >= 1, "onHead fires when attentive")
+			T.check((attentive.entityJumped or 0) >= 1, "jumps are seen when attentive")
+			T.check((attentive.blocked or 0) >= 1 and (attentive.bumped or 0) >= 1, "locomotion events when attentive")
+			T.check((attentive.groupNearby or 0) >= 1, "groups when attentive")
+			T.equal(attentive.chatHeard, 2, "both lines heard when attentive")
+
+			local off, senses, memory = scene(true)
+			T.equal(off.chatHeard, 1, "only the named line")
+			T.equal(off.entityAppeared, nil)
+			T.equal(off.stared, nil)
+			T.equal(off.onHead, nil)
+			T.equal(off.entityJumped, nil)
+			T.equal(off.groupNearby, nil)
+			T.equal(off.blocked, nil)
+			-- Sightings are still recorded: memory and the visibility bookkeeping keep up.
+			T.check(memory.entities.s ~= nil and memory.entities.s.timesSeen >= 13, "memory records the starer")
+			T.check(memory.entities.s.lastSeenVisibleAt ~= nil, "seen, not just tracked")
+			T.equal(senses.visible.s, true)
+			T.check(not senses:isReading(6), "no reading windows open while attention is off")
+		end)
 	end)
 end

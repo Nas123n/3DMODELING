@@ -13,6 +13,7 @@
 -- it) gives up after a few seconds, a wall bump steers at the wall itself instead of walking
 -- away along the old heading, and a follower left holding when an event ends is resumed, so the
 -- humanizer can never leave a trip that would otherwise finish hanging.
+-- requires: CameraModel, InputProfile, NavMath, Rng, Timing, Types, WaypointFollower
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)

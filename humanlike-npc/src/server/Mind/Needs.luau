@@ -6,6 +6,7 @@
 -- social -> grind rhythm real players show (design-mind §4.3). Rates are per second and put a
 -- full cycle in the 3-10 minute range; the running activity's engagement slows boredom, company
 -- drains social, and the mood table (Mood.multiplier "drift.<need>") skews each rate.
+-- requires: Personality, Rng
 
 local Personality = require(script.Parent.Personality)
 local Rng = require(script.Parent.Parent.Rng)

@@ -11,6 +11,7 @@
 --
 -- Draw order is pinned (style, skin tone, body-colour preset, hair, shirt, pants, face, hat count
 -- and hats, scales, catalogSeed); anything added later draws after catalogSeed.
+-- requires: AvatarCatalog, Rng, Types
 
 local Rng = require(script.Parent.Parent.Rng)
 local Types = require(script.Parent.Parent.Types)

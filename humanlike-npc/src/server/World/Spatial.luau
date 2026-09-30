@@ -7,6 +7,7 @@
 -- group it shares at least half of its members with, so a group that loses one member is still
 -- "the same group" to everyone watching it and its age keeps growing. Players and NPCs are
 -- treated alike (DR-48). Pure: plain tables, injected time, no instance API.
+-- requires: (none)
 
 local Spatial = {}
 Spatial.__index = Spatial

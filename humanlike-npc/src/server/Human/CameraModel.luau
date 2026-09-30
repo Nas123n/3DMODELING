@@ -3,6 +3,7 @@
 -- lags behind where the player wants to go: on a straight leg nothing shows, but at a corner the
 -- player first walks at 45 degrees while the mouse catches up, which is the "zig" everyone has
 -- seen. Nobody can see an NPC's camera, so this only has to reproduce that visible effect.
+-- requires: NavMath
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 

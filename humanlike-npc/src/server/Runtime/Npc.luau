@@ -1,23 +1,32 @@
 --!strict
--- One NPC end to end: senses feed the brain, the brain's intent becomes a path request or a
--- direct move, the follower walks the path while the stuck detector, the recovery ladder, local
--- steering and the humanizer shape every command, and the body adapter applies it. Chat and
--- emotes go out through the presenter. Everything here is pure; the adapters (mover, presenter,
--- perception) are injected, so the whole loop runs under Lune with fake bodies.
+-- One NPC end to end, as the wiring between the pure pieces: the perception adapter feeds the
+-- senses, the senses feed the brain, the brain's intent goes to Nav/Locomotion (path requests,
+-- the follower, stuck detection, recovery, steering, timed steps and freezes), the humanizer and
+-- the optional mimic sampler shape the command, and the body adapter applies it. Chat, emotes,
+-- typing, seats and the leave and reset stories go out through the presenter. It owns the
+-- per-NPC policies the pieces cannot: the far-tier conversion of a walk into `moveTo`, camera
+-- glances, the reset budget (three per session, the fourth leaves), the short ritual after a body
+-- swap, the forced-goal test seam, and the event strings a Report carries. It is not the
+-- locomotion state machine (Locomotion), not the mind (Brain) and not the service that schedules
+-- and contains it (NpcService): nothing here catches errors, they propagate to the owner. Pure:
+-- time is injected, every draw comes from forks of the seed it is given in a fixed order, and
+-- every adapter is a table, so the whole loop runs under Lune with fake bodies.
+-- requires: Activities, Brain, Humanizer, Locomotion, Memory, MimicSampler, NavMath, PathPlanner, Ports, Rng,
+-- Senses, TraceBank, Types
 
 local Rng = require(script.Parent.Parent.Rng)
 local Types = require(script.Parent.Parent.Types)
+local Ports = require(script.Parent.Parent.Ports)
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
-local WaypointFollower = require(script.Parent.Parent.Nav.WaypointFollower)
-local StuckDetector = require(script.Parent.Parent.Nav.StuckDetector)
-local Recovery = require(script.Parent.Parent.Nav.Recovery)
-local Steering = require(script.Parent.Parent.Nav.Steering)
 local PathPlanner = require(script.Parent.Parent.Nav.PathPlanner)
+local Locomotion = require(script.Parent.Parent.Nav.Locomotion)
 local Humanizer = require(script.Parent.Parent.Human.Humanizer)
 local Brain = require(script.Parent.Parent.Mind.Brain)
 local Senses = require(script.Parent.Parent.Mind.Senses)
 local Activities = require(script.Parent.Parent.Mind.Activities)
 local Memory = require(script.Parent.Parent.Mind.Memory)
+local MimicSampler = require(script.Parent.Parent.Mimic.MimicSampler)
+local TraceBank = require(script.Parent.Parent.Mimic.TraceBank)
 
 type Rng = Rng.Rng
 type BodyState = Types.BodyState
@@ -28,35 +37,25 @@ type Action = Activities.Action
 local Npc = {}
 Npc.__index = Npc
 
-export type Identity = { id: string, username: string, displayName: string }
+export type Identity = Types.Identity
 
--- The body: read its state, apply a command, teleport it (reset story), probe walls.
-export type Mover = {
-	read: (self: any) -> BodyState,
-	apply: (self: any, command: MoveCommand) -> (),
-	teleport: (self: any, position: Vector3) -> (),
-	probe: ((self: any, position: Vector3, forward: Vector3) -> (number?, number?))?,
-}
+-- The body: read its state, apply a command, place it (spawn and reset only), probe walls.
+export type Mover = Ports.Mover
 
--- Presentation: chat, emotes, and what the game does when an NPC leaves.
-export type Presenter = {
-	say: (self: any, npcId: string, text: string, target: string?) -> (),
-	emote: (self: any, npcId: string, name: string?, cutAfter: number?) -> (),
-	leave: (self: any, npcId: string, reason: string) -> (),
-	reset: ((self: any, npcId: string) -> ())?,
-}
+-- Presentation: chat, emotes, typing, seats, and what the game does when an NPC leaves or resets.
+export type Presenter = Ports.Presenter
 
 -- What the world looks like from here: entities near me, chats heard, groups, POIs, navigation queries.
-export type Perception = {
-	snapshot: (self: any, npcId: string, position: Vector3, radius: number) -> { entities: { any }, chats: { any } },
-	occlusion: ((from: Vector3, to: Vector3) -> boolean)?,
-	groups: (self: any) -> { any },
-	groupOf: (self: any, id: string) -> any?,
-	entity: (self: any, id: string) -> any?,
-	world: any, -- Goals.World minus the per-NPC bits
-	playersWithin: (self: any, position: Vector3, radius: number) -> number,
-	walkableCheck: ((point: Vector3) -> string)?,
-	losCheck: ((from: Vector3, to: Vector3) -> boolean)?,
+export type Perception = Ports.Perception
+
+-- The shared chat plumbing (Overlays.ChatShared, typed structurally so this module does not require
+-- Overlays): the recency tracker, the safety gate, the server-wide allow closure and, when the
+-- service has one, the ChatGuard.
+export type ChatShared = {
+	recency: any,
+	safety: any,
+	allow: (npcId: string, now: number) -> boolean,
+	guard: any?,
 }
 
 export type Deps = {
@@ -64,8 +63,13 @@ export type Deps = {
 	presenter: Presenter,
 	perception: Perception,
 	planner: PathPlanner.Planner,
-	chat: any, -- Overlays.ChatShared
+	chat: ChatShared,
 	agentParams: { canJump: boolean }?,
+	killY: number?, -- below this height the body has left the world; default -500
+	mimic: MimicSampler.Sampler?, -- when set, near-tier move commands are shaped toward the crowd's speeds
+	traces: TraceBank.Bank?, -- when set, an idle near-tier NPC now and then replays a learned fragment
+	customWaypoint: ((label: string?, position: Vector3) -> number?)?, -- seconds to hold at a Custom waypoint
+	poiWord: string?, -- a fixed {poi} word for the talk overlay; else the nearest POI's word or kind
 }
 
 export type Report = {
@@ -78,9 +82,15 @@ export type Report = {
 	target: string?,
 	mood: string,
 	phase: string,
-	locomotion: string,
+	locomotion: string, -- "idle" | "planning" | "walking" | "arrived" | "failed" | "dead"
 	recoveryLevel: number,
 	events: { string },
+	-- additive
+	tier: Types.Tier?,
+	typing: boolean?,
+	sitting: string?, -- the seat id while seated
+	resetsUsed: number?,
+	brainRan: boolean?,
 }
 
 export type NpcT = typeof(setmetatable(
@@ -92,32 +102,14 @@ export type NpcT = typeof(setmetatable(
 		rng: Rng,
 		deps: Deps,
 		brain: Brain.BrainT,
-		senses: any,
+		senses: any, -- Senses.Senses; a test may swap in a scripted one
 		humanizer: Humanizer.HumanizerT,
-		stuck: StuckDetector.Detector,
-		recovery: Recovery.Ladder,
-		steering: Steering.Steerer,
-		follower: WaypointFollower.Follower?,
-		locomotionStatus: string, -- idle | planning | walking | arrived | failed
-		goal: Vector3?,
-		goalTolerance: number,
-		requestId: number?,
-		nextRequestId: number,
-		lastPlanAt: number,
-		followTarget: string?,
-		followKeep: number,
-		lastFollowGoal: Vector3?,
-		stepUntil: number,
-		stepDir: Vector3?,
-		freezeUntil: number,
-		freezeVariant: string,
-		freezeDir: Vector3?,
-		facingYaw: number?,
-		jumpRequested: boolean,
+		loco: Locomotion.LocomotionT,
+		mimicRng: Rng,
+		glanceRng: Rng,
 		brainCounter: number,
 		lastBody: BodyState?,
 		lastCommand: MoveCommand?,
-		tripId: number,
 		emoteUntil: number,
 		leaving: boolean,
 		lastTickAt: number,
@@ -125,22 +117,103 @@ export type NpcT = typeof(setmetatable(
 		distanceWalked: number,
 		lastVelocity: Vector3?,
 		velocityJump: number?,
-		lastSteerBlockedBy: string?,
 		lastThinkAt: number?,
-		jumpFailures: number,
 		lastRemaining: number?,
+		lastLocomotion: string,
+		resetsUsed: number,
+		dead: boolean, -- the body is gone until the adapter's rebind
+		typing: boolean,
+		sitting: string?,
+		poiWordOverride: string?,
+		ritualUntil: number, -- the short hold after a body swap
+		forcedGoal: Vector3?, -- test seam: a goto that bypasses the brain until arrival
+		humanizedTrip: number, -- the last tripId handed to the humanizer
+		farPoint: Vector3?, -- the moveTo point issued in a far tier
+		farIssuedAt: number,
+		pendingEvents: { string }, -- events raised between ticks (onSystemEvent), reported by the next tick
+		fragment: TraceBank.Fragment?, -- a learned fragment being replayed while idle
+		fragmentIndex: number,
+		fragmentStepAt: number,
+		fragmentYaw: number,
 	},
 	Npc
 ))
 
 local STOP: MoveCommand = { mode = "stop", dir = Vector3.zero, magnitude = 0, jump = false }
 
+local KILL_Y_DEFAULT = -500
+local FAR_MOVE_TO_MAX = 16 -- studs: the moveTo point lies at most this far along the walk
+local FAR_REISSUE = 6 -- seconds: a far moveTo is re-issued at least this often (the engine's timeout is 8)
+local GLANCE_RANGE = 20 -- studs: a seen or jumping entity closer than this may draw a camera glance
+local GLANCE_CHANCE = 0.5
+local GLANCE_CHANCE_SOCIAL = 0.7 -- sociability > 0.6
+local GLANCE_SOCIABILITY = 0.6
+local MAX_RESETS = 3 -- per session; the next reset makes the NPC leave instead
+local RITUAL_MEDIAN, RITUAL_SPREAD, RITUAL_LO, RITUAL_HI = 1, 0.4, 0.5, 2 -- the hold after a body swap
+local LOOKAHEAD_NEWCOMER = 2 -- studs less follower lookahead when familiarity < 0.3
+local FAMILIARITY_NEWCOMER = 0.3
+local FRAGMENT_CHANCE = 0.05 -- per brain step while idle in the near tier, with a trace bank
+
 local function stop(): MoveCommand
 	return { mode = "stop", dir = Vector3.zero, magnitude = 0, jump = false }
 end
 
+local function isQuiet(tier: string): boolean
+	return tier == "far" or tier == "dormant"
+end
+
+local function isKeyboard(persona: any): boolean
+	local profile = persona.profile
+	local kind = if profile then profile.kind else nil
+	return kind == "pc" or kind == "pcShiftLock"
+end
+
 function Npc.new(identity: Identity, persona: any, seed: Rng, deps: Deps, now: number, favoritePoiKind: string?): NpcT
 	local rng = seed:fork("npc:" .. identity.id)
+	-- Fixed fork order (Appendix A): brain, senses, human, recovery, steer, loco, mimic, glance.
+	local brain = Brain.new(rng:fork("brain"), persona, now, favoritePoiKind)
+	local senses = Senses.new(rng:fork("senses"), persona)
+	local humanizer =
+		Humanizer.new(rng:fork("human"), persona.profile, persona, { walkableCheck = deps.perception.walkableCheck })
+	local recoveryRng = rng:fork("recovery")
+	local steerRng = rng:fork("steer")
+	local familiarity: number = persona.familiarity or 1
+	local lookahead: number = persona.profile.lookahead
+	if familiarity < FAMILIARITY_NEWCOMER then
+		lookahead = math.max(2, lookahead - LOOKAHEAD_NEWCOMER)
+	end
+	-- The closures read `deps` at call time, so a rebind (which swaps deps.mover) reaches them.
+	local locoDeps: Locomotion.Deps = {
+		planner = deps.planner,
+		losCheck = deps.perception.losCheck,
+		probe = function(position: Vector3, forward: Vector3): (number?, number?)
+			local mover = deps.mover
+			local probe = mover.probe
+			if probe then
+				return probe(mover, position, forward)
+			end
+			return nil, nil
+		end,
+		entity = function(id: string): Types.AgentView?
+			return deps.perception:entity(id)
+		end,
+		agentId = identity.id,
+		canJump = if deps.agentParams then deps.agentParams.canJump else true,
+		lookahead = lookahead,
+		killY = deps.killY or KILL_Y_DEFAULT,
+		customWaypoint = deps.customWaypoint,
+	}
+	local loco = Locomotion.new(rng:fork("loco"), locoDeps, {
+		stuckAfter = 0.8 + 0.7 * persona.patience,
+		personalSpace = 0.5 + 1.5 * (1 - persona.trolliness),
+		ignoreChance = 0.5 + 0.3 * persona.trolliness,
+		jumpShare = 0.7 + 0.15 * persona.impulsivity,
+		pushOnlyBlocking = true,
+		recoveryRng = recoveryRng,
+		steerRng = steerRng,
+	}, now)
+	local mimicRng = rng:fork("mimic")
+	local glanceRng = rng:fork("glance")
 	local self = setmetatable({
 		id = identity.id,
 		entityId = "n:" .. identity.id,
@@ -148,42 +221,15 @@ function Npc.new(identity: Identity, persona: any, seed: Rng, deps: Deps, now: n
 		persona = persona,
 		rng = rng,
 		deps = deps,
-		brain = Brain.new(rng:fork("brain"), persona, now, favoritePoiKind),
-		senses = Senses.new(rng:fork("senses"), persona),
-		humanizer = Humanizer.new(
-			rng:fork("human"),
-			persona.profile,
-			persona,
-			{ walkableCheck = deps.perception.walkableCheck }
-		),
-		stuck = StuckDetector.new({ stuckAfter = 0.8 + 0.7 * persona.patience }),
-		recovery = Recovery.new(rng:fork("recovery")),
-		steering = Steering.new(rng:fork("steer"), {
-			personalSpace = 0.5 + 1.5 * (1 - persona.trolliness),
-			ignoreChance = 0.1 + 0.4 * persona.trolliness,
-			jumpShare = 0.7 + 0.15 * persona.impulsivity,
-		}),
-		follower = nil,
-		locomotionStatus = "idle",
-		goal = nil,
-		goalTolerance = 1.5,
-		requestId = nil,
-		nextRequestId = 1,
-		lastPlanAt = -math.huge,
-		followTarget = nil,
-		followKeep = 3,
-		lastFollowGoal = nil,
-		stepUntil = -math.huge,
-		stepDir = nil,
-		freezeUntil = -math.huge,
-		freezeVariant = "still",
-		freezeDir = nil,
-		facingYaw = nil,
-		jumpRequested = false,
+		brain = brain,
+		senses = senses,
+		humanizer = humanizer,
+		loco = loco,
+		mimicRng = mimicRng,
+		glanceRng = glanceRng,
 		brainCounter = 0,
 		lastBody = nil,
 		lastCommand = nil,
-		tripId = 0,
 		emoteUntil = -math.huge,
 		leaving = false,
 		lastTickAt = now,
@@ -191,185 +237,223 @@ function Npc.new(identity: Identity, persona: any, seed: Rng, deps: Deps, now: n
 		distanceWalked = 0,
 		lastVelocity = nil,
 		velocityJump = nil,
-		lastSteerBlockedBy = nil,
 		lastThinkAt = nil,
-		jumpFailures = 0,
 		lastRemaining = nil,
+		lastLocomotion = "idle",
+		resetsUsed = 0,
+		dead = false,
+		typing = false,
+		sitting = nil,
+		poiWordOverride = nil,
+		ritualUntil = -math.huge,
+		forcedGoal = nil,
+		humanizedTrip = 0,
+		farPoint = nil,
+		farIssuedAt = -math.huge,
+		pendingEvents = {},
+		fragment = nil,
+		fragmentIndex = 1,
+		fragmentStepAt = -math.huge,
+		fragmentYaw = 0,
 	}, Npc)
 	return self
 end
 
 function Npc.setTier(self: NpcT, tier: string)
+	if tier ~= self.tier then
+		self.farPoint = nil
+	end
 	self.tier = tier
 	self.humanizer:setTier(tier)
 end
 
--- Plans a trip to a goal (or re-plans the current one).
-local function requestPath(self: NpcT, body: BodyState, goal: Vector3, now: number, priority: number)
-	local id = self.nextRequestId
-	self.nextRequestId += 1
-	self.requestId = id
-	self.goal = goal
-	self.locomotionStatus = "planning"
-	self.lastPlanAt = now
-	local canJump = if self.deps.agentParams then self.deps.agentParams.canJump else true
-	self.deps.planner:request({
-		id = id,
-		agentId = self.id,
-		start = body.position,
-		goal = goal,
-		priority = priority,
-		allowPartial = true,
-		canJump = canJump,
-		issuedAt = now,
-	}, now)
+-- A fixed {poi} word for the talk overlay (nil: back to the nearest POI's word or kind).
+function Npc.setPoiWord(self: NpcT, word: string?)
+	self.poiWordOverride = word
+end
+
+-- Hands a freshly started trip to the humanizer (once per tripId).
+local function humanizeNewTrip(self: NpcT, now: number)
+	local loco = self.loco
+	local follower = loco.follower
+	if follower and loco.tripId ~= self.humanizedTrip then
+		self.humanizedTrip = loco.tripId
+		self.humanizer:beginTrip(follower, now, loco.tripId)
+	end
 end
 
 -- A completion from the planner (the service routes them by agent id).
 function Npc.onPathResult(self: NpcT, completion: PathPlanner.Completion, now: number)
-	if completion.id ~= self.requestId then
+	if self.dead then
 		return
 	end
-	self.requestId = nil
-	local result = completion.result
-	local body = self.lastBody or self.deps.mover:read()
-	if (result.status == "Success" or result.status == "Partial") and #result.waypoints > 0 then
-		self.tripId += 1
-		self.follower = WaypointFollower.new(result.waypoints, body.position, now, {
-			lookahead = self.persona.profile.lookahead,
-			losCheck = self.deps.perception.losCheck,
-		})
-		self.humanizer:beginTrip(self.follower :: WaypointFollower.Follower, now, self.tripId)
-		self.locomotionStatus = "walking"
-		self.recovery:onNewGoal(now)
-		self.stuck:reset(now)
-		self.recovery:onPathArrived()
-	else
-		self.follower = nil
-		self.locomotionStatus = "failed"
-		self.recovery:onPathArrived()
+	self.loco:onPathResult(completion, now)
+	humanizeNewTrip(self, now)
+end
+
+-- The engine reported the path blocked at a waypoint (Path.Blocked): true when locomotion re-requested.
+function Npc.onBlocked(self: NpcT, blockedIndex: number, now: number): boolean
+	if self.dead then
+		return false
+	end
+	return self.loco:onBlocked(blockedIndex, now)
+end
+
+-- Something happened to the body or the session that the brain must know (stuck, fell, flung,
+-- goalInvalid, avoidExit, nameCollision, serverClosing, kicked, gameEvent). A goal that turned
+-- invalid also ends the trip toward it at once.
+function Npc.onSystemEvent(self: NpcT, kind: string, now: number, position: Vector3?, data: any?)
+	self.brain:onSystemEvent(kind, now, position, data)
+	if kind == "goalInvalid" then
+		local loco = self.loco
+		if loco.follower ~= nil or loco.requestId ~= nil then
+			loco:cancel("goalInvalid", now)
+		end
+		self.forcedGoal = nil
+	elseif kind == "avoidExit" then
+		table.insert(self.pendingEvents, "avoidExit")
 	end
 end
 
-local function clearTrip(self: NpcT)
-	self.follower = nil
-	self.requestId = nil
-	self.followTarget = nil
+-- Test seam: walk to `position` regardless of what the brain wants, until the trip ends.
+function Npc.forceGoal(self: NpcT, position: Vector3, now: number)
+	self.forcedGoal = position
+	local body = self.lastBody
+	if body and not self.dead and now >= self.ritualUntil then
+		self.loco:setIntent({ kind = "goto", position = position, urgency = 0.9, tolerance = 2 }, body, now)
+		humanizeNewTrip(self, now)
+	end
 end
 
--- Applies the brain's intent to the locomotion state.
-local function applyIntent(self: NpcT, intent: Intent, body: BodyState, now: number)
-	local kind = intent.kind
-	if kind == "goto" then
-		local position = intent.position :: Vector3
-		self.goalTolerance = intent.tolerance or 1.5
-		local same = self.goal ~= nil and NavMath.flatDistance(self.goal :: Vector3, position) < 0.5
-		if not same then
-			clearTrip(self)
-			requestPath(self, body, position, now, if (intent.urgency or 0) >= 0.8 then 0 else 1)
-		elseif self.locomotionStatus == "failed" and now - self.lastPlanAt > 3 then
-			requestPath(self, body, position, now, 2)
+-- The adapter's fresh body after a reset or a respawn: locomotion starts over and the NPC stands
+-- still for a short ritual before its next trip.
+function Npc.rebind(self: NpcT, mover: Mover, now: number)
+	self.deps.mover = mover
+	self.dead = false
+	self.lastBody = nil
+	self.lastVelocity = nil
+	self.velocityJump = nil
+	self.lastCommand = nil
+	self.lastRemaining = nil
+	self.farPoint = nil
+	self.fragment = nil
+	self.emoteUntil = -math.huge
+	self.loco:reset(now)
+	self.lastLocomotion = "idle"
+	self.ritualUntil = now + self.rng:logNormalClamped(RITUAL_MEDIAN, RITUAL_SPREAD, RITUAL_LO, RITUAL_HI)
+end
+
+-- The word for {poi} lines: the override, the fixed dep, else the nearest POI the NPC stands at.
+local function poiWordFor(self: NpcT, position: Vector3): string?
+	if self.poiWordOverride then
+		return self.poiWordOverride
+	end
+	if self.deps.poiWord then
+		return self.deps.poiWord
+	end
+	local world: any = self.deps.perception.world
+	local pois = if world then world.pois else nil
+	if type(pois) ~= "table" then
+		return nil
+	end
+	local best: any = nil
+	local bestDistance = math.huge
+	for _, poi in pois do
+		local d = NavMath.flatDistance(poi.position, position)
+		if d <= (poi.radius or 6) and d < bestDistance then
+			best, bestDistance = poi, d
 		end
-		self.followTarget = nil
-	elseif kind == "follow" then
-		local targetId = intent.targetId :: string
-		local target = self.deps.perception:entity(targetId)
-		self.followKeep = intent.keep or 3
-		if not target then
-			return
+	end
+	if best then
+		return best.word or best.kind
+	end
+	return nil
+end
+
+-- Camera glances (keyboard profiles only): a seen or jumping entity within range draws a short
+-- look toward it, which the camera model turns into a small route wobble.
+local function glances(self: NpcT, events: { any }, body: BodyState, now: number)
+	if not isKeyboard(self.persona) then
+		return
+	end
+	local p = if (self.persona.sociability or 0) > GLANCE_SOCIABILITY then GLANCE_CHANCE_SOCIAL else GLANCE_CHANCE
+	for _, e in events do
+		local kind = e.kind
+		if kind ~= "entityAppeared" and kind ~= "seen" and kind ~= "entityJumped" and kind ~= "jumpSeen" then
+			continue
 		end
-		local behind = NavMath.flatDirection(target.position, body.position)
-		if behind.Magnitude == 0 then
-			behind = NavMath.dirFromYaw(target.yaw or 0) * -1
+		local data = e.data
+		local at: Vector3? = if type(data) == "table" then data.position else nil
+		if not at then
+			continue
 		end
-		local goal = target.position + behind * self.followKeep
-		local moved = self.lastFollowGoal == nil or NavMath.flatDistance(self.lastFollowGoal :: Vector3, goal) > 4
-		if self.followTarget ~= targetId or (moved and now - self.lastPlanAt >= 1.5) then
-			self.followTarget = targetId
-			self.lastFollowGoal = goal
-			local los = self.deps.perception.losCheck
-			if los and los(body.position, goal) and NavMath.flatDistance(body.position, goal) < 30 then
-				-- Direct line: no planner needed.
-				self.follower = WaypointFollower.new({
-					{ position = body.position, action = "Walk" },
-					{ position = goal, action = "Walk" },
-				}, body.position, now, { lookahead = 8 })
-				self.goal = goal
-				self.locomotionStatus = "walking"
-				self.lastPlanAt = now
-			else
-				clearTrip(self)
-				self.followTarget = targetId
-				requestPath(self, body, goal, now, 1)
+		local distance: number = if type(data) == "table" and type(data.distance) == "number"
+			then data.distance
+			else NavMath.flatDistance(at :: Vector3, body.position)
+		if distance > GLANCE_RANGE then
+			continue
+		end
+		if self.glanceRng:chance(p) then
+			self.humanizer:lookAt(at :: Vector3, body.position, now + self.glanceRng:range(0.3, 1))
+		end
+	end
+end
+
+-- Builds the brain's world view from the perception adapter and the senses, and steps the brain.
+-- Far and dormant NPCs skip the snapshot and the senses: nobody is close enough to be noticed.
+local function think(
+	self: NpcT,
+	body: BodyState,
+	now: number,
+	dt: number,
+	moving: boolean,
+	quiet: boolean
+): Brain.Output
+	local perception = self.deps.perception
+	local heading = NavMath.dirFromYaw(body.yaw)
+	local events: { any } = {}
+	local entities: { any } = {}
+	local visible: { [string]: boolean } = {}
+	local groups: { any } = {}
+	local playersWithin30, playersWithin100 = 0, 0
+	if not quiet then
+		local snap = perception:snapshot(self.id, body.position, 100)
+		groups = perception:groups()
+		events = self.senses:step({
+			me = {
+				id = self.entityId,
+				position = body.position,
+				heading = heading,
+				moving = moving,
+				velocity = body.velocity,
+			},
+			entities = snap.entities,
+			chats = snap.chats,
+			groups = groups,
+			now = now,
+			dt = dt,
+			occlusion = perception.occlusion,
+			raycastBudget = 8,
+			locomotion = { blockedBy = self.loco.lastSteerBlockedBy, velocityJump = self.velocityJump },
+		}, self.brain.memory, self.brain.guard.attachment)
+		glances(self, events, body, now)
+		for _, e in snap.entities do
+			local record = self.brain.memory.entities[e.id]
+			if record and record.lastSeenVisibleAt and now - record.lastSeenVisibleAt < 1 then
+				visible[e.id] = true
 			end
 		end
-	elseif kind == "hold" then
-		if self.locomotionStatus == "walking" or self.locomotionStatus == "planning" then
-			clearTrip(self)
-			self.locomotionStatus = "idle"
-		end
-	elseif kind == "step" then
-		self.stepDir = intent.dir
-		self.stepUntil = now + (intent.duration or 0.3)
-	elseif kind == "jump" then
-		self.jumpRequested = true
-	elseif kind == "face" then
-		self.facingYaw = intent.yaw
-	elseif kind == "freeze" then
-		self.freezeUntil = now + (intent.duration or 1)
-		self.freezeVariant = intent.variant or "still"
-		if self.freezeVariant == "walkStraight" then
-			local last = self.lastCommand
-			self.freezeDir = if last and last.mode == "move" then last.dir else nil
-		end
-		-- Typing is a deliberate stop (or a deliberate straight walk): never a stuck verdict.
-		self.stuck:suppress(now, self.freezeUntil)
+		entities = table.clone(snap.entities)
+		table.sort(entities, function(a, b)
+			return NavMath.flatDistance(a.position, body.position) < NavMath.flatDistance(b.position, body.position)
+		end)
+		playersWithin30 = perception:playersWithin(body.position, 30)
+		playersWithin100 = perception:playersWithin(body.position, 100)
 	end
-	if (intent :: any).jump then
-		self.jumpRequested = true
-	end
-end
-
--- Builds the brain's world view from the perception adapter and the senses.
-local function think(self: NpcT, body: BodyState, now: number, dt: number, moving: boolean): Brain.Output
-	local perception = self.deps.perception
-	local snap = perception:snapshot(self.id, body.position, 100)
-	local heading = NavMath.dirFromYaw(body.yaw)
-	local visible: { [string]: boolean } = {}
-	local events = self.senses:step({
-		me = {
-			id = self.entityId,
-			position = body.position,
-			heading = heading,
-			moving = moving,
-			velocity = body.velocity,
-		},
-		entities = snap.entities,
-		chats = snap.chats,
-		groups = perception:groups(),
-		now = now,
-		dt = dt,
-		occlusion = perception.occlusion,
-		raycastBudget = 8,
-		locomotion = { blockedBy = self.lastSteerBlockedBy, velocityJump = self.velocityJump },
-	}, self.brain.memory, self.brain.guard.attachment)
-	for _, e in snap.entities do
-		local record = self.brain.memory.entities[e.id]
-		if record and record.lastSeenVisibleAt and now - record.lastSeenVisibleAt < 1 then
-			visible[e.id] = true
-		end
-	end
-	local sorted = table.clone(snap.entities)
-	table.sort(sorted, function(a, b)
-		return NavMath.flatDistance(a.position, body.position) < NavMath.flatDistance(b.position, body.position)
-	end)
-	local world = table.clone(perception.world)
-	world.entities = sorted
+	local world: any = table.clone(perception.world :: any)
+	world.entities = entities
 	world.visible = visible
-	world.groups = perception:groups()
-	local groupOf = function(id)
-		return perception:groupOf(id)
-	end
+	world.groups = groups
 	return self.brain:step({
 		now = now,
 		dt = dt,
@@ -380,51 +464,254 @@ local function think(self: NpcT, body: BodyState, now: number, dt: number, movin
 			displayName = self.identity.displayName,
 			username = self.identity.username,
 		},
-		locomotion = {
-			status = self.locomotionStatus,
-			goal = self.goal,
-			moving = moving,
-			onGround = body.onGround,
-			blockedBy = self.lastSteerBlockedBy,
-		},
+		locomotion = self.loco:brainView(body),
 		world = world,
 		entity = function(id)
 			return perception:entity(id)
 		end,
-		groupOf = groupOf,
+		groupOf = function(id)
+			return perception:groupOf(id)
+		end,
 		events = events,
-		playersWithin30 = perception:playersWithin(body.position, 30),
-		playersWithin100 = perception:playersWithin(body.position, 100),
+		playersWithin30 = playersWithin30,
+		playersWithin100 = playersWithin100,
 		chat = self.deps.chat,
 		fellNearby = false,
+		tier = self.tier,
+		poiWord = poiWordFor(self, body.position),
 	})
 end
 
-local function runActions(self: NpcT, actions: { Action }, now: number)
+-- Carries out the brain's actions through the presenter.
+local function runActions(self: NpcT, actions: { Action }, now: number, events: { string })
 	local presenter = self.deps.presenter
 	for _, a in actions do
-		if a.kind == "say" and a.text then
+		local kind = a.kind
+		if kind == "say" and a.text then
 			presenter:say(self.id, a.text, a.target)
-		elseif a.kind == "emote" then
+		elseif kind == "emote" then
 			presenter:emote(self.id, a.name, a.cutAfter)
 			self.emoteUntil = now + (a.cutAfter or 3)
-		elseif a.kind == "leave" then
+		elseif kind == "leave" then
 			self.leaving = true
 			presenter:leave(self.id, "session")
-		elseif a.kind == "leaveServer" then
+		elseif kind == "leaveServer" then
 			self.brain:leaveNow()
+		elseif kind == "typing" then
+			local on = a.on == true
+			self.typing = on
+			local setTyping = presenter.setTyping
+			if setTyping then
+				setTyping(presenter, self.id, on)
+			end
+		elseif kind == "sit" then
+			self.sitting = a.target
+			local seat = presenter.seat
+			if seat then
+				seat(presenter, self.id, a.target)
+			end
+		elseif kind == "look" and a.name then
+			table.insert(events, a.name)
 		end
 	end
+end
+
+-- The reset story: the adapter destroys the body and rebinds a fresh one later; after the third
+-- reset of a session the NPC leaves instead (a player who keeps dying logs off).
+local function onReset(self: NpcT, body: BodyState, now: number)
+	self.resetsUsed += 1
+	self.forcedGoal = nil
+	self.farPoint = nil
+	self.fragment = nil
+	self.brain:onSystemEvent("stuck", now, body.position)
+	if self.resetsUsed > MAX_RESETS then
+		self.brain:leaveNow()
+		self.leaving = true
+		self.deps.presenter:leave(self.id, "reset")
+		return
+	end
+	local presenter = self.deps.presenter
+	local reset = presenter.reset
+	if reset then
+		self.dead = true
+		reset(presenter, self.id)
+	else
+		-- No adapter to respawn the body: it stays what it is and locomotion simply starts over.
+		self.loco:reset(now)
+		self.ritualUntil = now + self.rng:logNormalClamped(RITUAL_MEDIAN, RITUAL_SPREAD, RITUAL_LO, RITUAL_HI)
+	end
+end
+
+-- Locomotion events become report strings; some also reach the brain, the humanizer or the reset story.
+local function handleLocomotionEvents(
+	self: NpcT,
+	out: Locomotion.Output,
+	body: BodyState,
+	now: number,
+	events: { string }
+)
+	for _, e in out.events do
+		local kind = e.kind
+		if kind == "stuck" then
+			table.insert(events, `stuck:{e.level or 0}`)
+		elseif kind == "jumpFailed" then
+			table.insert(events, `jumpFailed:{e.label or "?"}`)
+		else
+			table.insert(events, kind)
+		end
+		if kind == "tripStarted" then
+			humanizeNewTrip(self, now)
+		elseif kind == "abandon" then
+			self.forcedGoal = nil
+			self.brain:onSystemEvent("stuck", now, body.position)
+		elseif kind == "fell" then
+			self.brain:onSystemEvent("fell", now, body.position)
+		elseif kind == "flung" then
+			self.forcedGoal = nil
+			self.brain:onSystemEvent("flung", now, body.position)
+		elseif kind == "arrived" or kind == "pathFailed" or kind == "goalInvalid" or kind == "changedMind" then
+			self.forcedGoal = nil
+		elseif kind == "reset" then
+			onReset(self, body, now)
+		end
+	end
+end
+
+-- The stuck verdict in the humanizer's vocabulary.
+local function humanizerVerdict(verdict: string): any
+	if verdict == "ok" then
+		return "ok"
+	elseif verdict == "pushing" or verdict == "wallCapped" then
+		return "pushing"
+	end
+	return "stuck"
+end
+
+-- Replays a learned movement fragment while the NPC idles in the near tier (Mimic/TraceBank):
+-- the fragment's per-tick directions replace the (stopped) command for its duration.
+local function playFragment(self: NpcT, command: MoveCommand, body: BodyState, now: number, idle: boolean): MoveCommand
+	local bank = self.deps.traces
+	if not bank or self.tier ~= "near" then
+		self.fragment = nil
+		return command
+	end
+	if command.mode ~= "stop" or not idle or not body.onGround then
+		self.fragment = nil
+		return command
+	end
+	local fragment = self.fragment
+	if fragment then
+		local step = fragment.steps[self.fragmentIndex]
+		if step and now - self.fragmentStepAt >= step.dt then
+			self.fragmentIndex += 1
+			self.fragmentStepAt = now
+			step = fragment.steps[self.fragmentIndex]
+		end
+		if not step then
+			self.fragment = nil
+			return command
+		end
+		local played = TraceBank.play(fragment, self.fragmentYaw, self.fragmentIndex)
+		played.facingYaw = command.facingYaw
+		return played
+	end
+	return command
+end
+
+-- Maybe starts a fragment on a brain step (one draw per idle near-tier step with a bank).
+local function maybeStartFragment(self: NpcT, out: Brain.Output, body: BodyState, now: number)
+	local bank = self.deps.traces
+	if not bank or self.tier ~= "near" or self.fragment ~= nil then
+		return
+	end
+	if out.intent.kind ~= "hold" or out.activity ~= "IdleStand" or self.loco:status() ~= "idle" then
+		return
+	end
+	if not self.mimicRng:chance(FRAGMENT_CHANCE) then
+		return
+	end
+	local fragment = bank:pick(self.mimicRng)
+	if fragment then
+		self.fragment = fragment
+		self.fragmentIndex = 1
+		self.fragmentStepAt = now
+		self.fragmentYaw = body.yaw
+	end
+end
+
+-- The point a far NPC walks to by moveTo: the farthest waypoint of the current path within
+-- FAR_MOVE_TO_MAX studs that the body has a line of walk to (the follower's own lookahead rule
+-- with a longer reach), the final target on the last leg; without a path (a recovery step, a
+-- timed step) a short way along the command's direction.
+local function farTarget(self: NpcT, command: MoveCommand, body: BodyState): Vector3
+	local follower = self.loco.follower
+	local los = self.deps.perception.losCheck
+	if follower and not follower.finished then
+		local waypoints = follower.waypoints
+		local n = #waypoints
+		local index = math.min(follower.nextIndex, n)
+		local best = waypoints[index].position
+		for k = index + 1, n do
+			local previous = waypoints[k - 1]
+			local w = waypoints[k]
+			if previous.action ~= "Walk" or math.abs(w.position.Y - previous.position.Y) > follower.stepHeight then
+				break
+			end
+			if NavMath.flatDistance(body.position, w.position) > FAR_MOVE_TO_MAX then
+				break
+			end
+			if los and not los(body.position, w.position) then
+				break
+			end
+			index, best = k, w.position
+		end
+		if index == n then
+			best = follower.finalTarget
+		end
+		return best
+	end
+	local lookahead: number = self.persona.profile.lookahead or 6
+	return body.position + command.dir * math.clamp(lookahead, 1, FAR_MOVE_TO_MAX)
+end
+
+-- Far and dormant tiers: a walk becomes a `moveTo` toward a point along it, re-issued when the
+-- body reports it finished or every few seconds; the engine walks the body between ticks.
+local function toMoveTo(self: NpcT, command: MoveCommand, body: BodyState, now: number): MoveCommand
+	if command.mode ~= "move" then
+		self.farPoint = nil
+		return command
+	end
+	local point = self.farPoint
+	if point == nil or body.moveToFinished == true or now - self.farIssuedAt >= FAR_REISSUE then
+		point = farTarget(self, command, body)
+		self.farPoint = point
+		self.farIssuedAt = now
+	end
+	return {
+		mode = "moveTo",
+		dir = command.dir,
+		magnitude = command.magnitude,
+		moveToPoint = point,
+		jump = command.jump,
+		facingYaw = command.facingYaw,
+	}
 end
 
 -- One scheduler tick. `runBrain` is true every Nth tick (the scheduler's brain divisor).
 function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 	local dt = math.max(0, now - self.lastTickAt)
 	self.lastTickAt = now
+	local eventsOut = self.pendingEvents
+	self.pendingEvents = {}
+	if self.dead then
+		-- The body is gone until the adapter rebinds a fresh one: nothing to read, nothing to drive.
+		self.lastLocomotion = "dead"
+		return self:report(stop(), "-", eventsOut, false)
+	end
 	local body = self.deps.mover:read()
 	self.lastBody = body
 	local moving = NavMath.flat(body.velocity).Magnitude > 1
-	local eventsOut: { string } = {}
+	local quiet = isQuiet(self.tier)
 
 	-- Velocity jumps (bumps) for the senses.
 	if self.lastVelocity then
@@ -433,181 +720,105 @@ function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 	end
 	self.lastVelocity = body.velocity
 
+	-- 1. Senses and brain, then the intent to locomotion and the actions to the presenter.
 	local brainOut: Brain.Output? = nil
 	if runBrain then
 		self.brainCounter += 1
 		local thinkDt = if self.lastThinkAt then now - self.lastThinkAt else dt
 		self.lastThinkAt = now
-		brainOut = think(self, body, now, thinkDt, moving)
-		applyIntent(self, (brainOut :: Brain.Output).intent, body, now)
-		runActions(self, (brainOut :: Brain.Output).actions, now)
+		local out = think(self, body, now, thinkDt, moving, quiet)
+		brainOut = out
+		local intent: Intent = out.intent
+		local forced = self.forcedGoal
+		if out.changedMind and not forced then
+			self.loco:cancel("changedMind", now)
+		end
+		if forced then
+			intent = { kind = "goto", position = forced, urgency = 0.9, tolerance = 2 }
+		end
+		if now < self.ritualUntil then
+			intent = { kind = "hold" }
+		end
+		self.loco:setIntent(intent, body, now)
+		humanizeNewTrip(self, now)
+		runActions(self, out.actions, now, eventsOut)
+		maybeStartFragment(self, out, body, now)
 	end
 	if self.leaving then
 		self.deps.mover:apply(stop())
-		return self:report(stop(), "leave", eventsOut)
+		self.lastCommand = stop()
+		return self:report(stop(), "leave", eventsOut, brainOut ~= nil)
 	end
 
-	-- Base command from the trip.
-	local command: MoveCommand = stop()
-	local followerEvents: { WaypointFollower.Event } = {}
-	local intendedSpeed = 0
-	local remaining = 0
-	local forward = NavMath.dirFromYaw(body.yaw)
-	if self.follower and self.locomotionStatus == "walking" then
-		local follower = self.follower :: WaypointFollower.Follower
-		local out = follower:tick(body, now)
-		followerEvents = out.events
-		command = out.command
-		remaining = out.remaining
-		self.lastRemaining = remaining
-		for _, e in out.events do
-			if e.kind == "finished" then
-				self.locomotionStatus = "arrived"
-				self.recovery:onNewGoal(now)
-				table.insert(eventsOut, "arrived")
-			elseif e.kind == "waypoint" then
-				self.recovery:onProgress(now, 4)
-			elseif e.kind == "jumpFailed" then
-				table.insert(eventsOut, "jumpFailed:" .. (e.label or "?"))
-				-- First failure: simply try the jump again. Second in a row: let recovery handle it
-				-- (back up and jump, then re-path with the jump penalized).
-				self.jumpFailures += 1
-				if self.jumpFailures <= 1 then
-					follower:resume()
-				else
-					local level = self.recovery:onStuck(now, body, forward, "stuck")
-					follower:resume()
-					if level >= 2 then
-						requestPath(self, body, self.goal :: Vector3, now, 0)
-					end
-				end
-			elseif e.kind == "jumpLanded" then
-				self.jumpFailures = 0
-			elseif e.kind == "custom" then
-				follower:resume()
-			end
-		end
-		if command.mode == "move" then
-			forward = command.dir
-			intendedSpeed = body.walkSpeed * command.magnitude
-		end
+	-- 2. Locomotion: the follower, stuck detection, recovery, steering, timed intents. Steering
+	-- wants the neighbours within 8 studs whenever a move command is possible (not while idle).
+	local neighbors: { Types.AgentView } = {}
+	if not quiet and (self.loco:status() ~= "idle" or now < self.loco.stepUntil) then
+		neighbors = self.deps.perception:snapshot(self.id, body.position, 8).entities
+	end
+	local out = self.loco:tick(body, neighbors, now, dt, self.humanizer:suppressUntil())
+	local command = out.command
+	self.lastRemaining = out.remaining
+	handleLocomotionEvents(self, out, body, now, eventsOut)
+	if self.dead then
+		self.lastLocomotion = "dead"
+		return self:report(stop(), if brainOut then brainOut.intent.kind else "-", eventsOut, brainOut ~= nil)
+	end
+	if self.leaving then
+		self.deps.mover:apply(stop())
+		self.lastCommand = stop()
+		return self:report(stop(), "leave", eventsOut, brainOut ~= nil)
 	end
 
-	-- Stuck detection and recovery on trips.
-	local verdict: string = "ok"
-	local humanizerQuietUntil = self.humanizer:suppressUntil()
-	if humanizerQuietUntil > now then
-		self.stuck:suppress(now, humanizerQuietUntil)
-	end
-	if self.locomotionStatus == "walking" then
-		verdict = self.stuck:update(body, intendedSpeed, remaining, now)
-	end
-	if self.recovery:isActive() then
-		local action = self.recovery:tick(now)
-		if action.kind == "repath" then
-			if self.goal then
-				requestPath(self, body, self.goal :: Vector3, now, 0)
-			end
-			command = stop()
-		elseif action.kind == "abandon" then
-			table.insert(eventsOut, "abandon")
-			self.locomotionStatus = "failed"
-			clearTrip(self)
-			self.brain:onSystemEvent("stuck", now, body.position)
-			command = stop()
-		elseif action.kind == "reset" then
-			table.insert(eventsOut, "reset")
-			self.locomotionStatus = "failed"
-			clearTrip(self)
-			if self.deps.presenter.reset then
-				(self.deps.presenter.reset :: any)(self.deps.presenter, self.id)
-			end
-			self.brain:onSystemEvent("fell", now, body.position)
-			command = stop()
-		elseif action.kind ~= "done" then
-			command = Recovery.toCommand(action, forward)
-			self.stuck:suppress(now, action.until_)
-		end
-	elseif verdict ~= "ok" then
-		local left, right = nil, nil
-		if self.deps.mover.probe then
-			left, right = (self.deps.mover.probe :: any)(self.deps.mover, body.position, forward)
-		end
-		local level = self.recovery:onStuck(now, body, forward, verdict :: any, left, right)
-		table.insert(eventsOut, `stuck:{level}`)
-		self.stuck:reset(now)
-		command = Recovery.toCommand(self.recovery:tick(now), forward)
-	end
-
-	-- Direct intents: timed steps, freezes.
-	if now < self.stepUntil and self.stepDir then
-		command = { mode = "move", dir = self.stepDir :: Vector3, magnitude = 1, jump = false }
-	end
-	if now < self.freezeUntil then
-		if self.freezeVariant == "walkStraight" and self.freezeDir then
-			command = { mode = "move", dir = self.freezeDir :: Vector3, magnitude = 1, jump = false }
-		else
-			command = stop()
-		end
-	end
-
-	-- Local avoidance of other characters (not while frozen: a typist does not dodge).
-	if command.mode == "move" and now >= self.freezeUntil then
-		local snap = self.deps.perception:snapshot(self.id, body.position, 8)
-		local steered = self.steering:adjust({
-			dir = command.dir,
-			magnitude = command.magnitude,
-			position = body.position,
-			velocity = body.velocity,
-			neighbors = snap.entities,
-			now = now,
-		})
-		command.dir = steered.dir
-		command.magnitude = steered.magnitude
-		self.lastSteerBlockedBy = steered.blockedBy
-		if steered.wantsJump then
-			self.jumpRequested = true
-		end
-	else
-		self.lastSteerBlockedBy = nil
-	end
-
-	-- Humanization of the trip command (freezes and recovery pass through mostly untouched).
-	if self.locomotionStatus == "walking" and not self.recovery:isActive() and now >= self.freezeUntil then
+	-- 3. Humanization of the trip command (input-profile noise and trip decoration).
+	if out.humanize then
 		local humanized = self.humanizer:apply({
 			command = command,
 			body = body,
 			now = now,
 			dt = dt,
-			followerEvents = followerEvents,
-			stuckVerdict = verdict :: any,
+			followerEvents = out.followerEvents,
+			stuckVerdict = humanizerVerdict(out.verdict),
 		})
 		command = humanized.command
 		for _, e in humanized.events do
 			table.insert(eventsOut, e.kind)
 		end
 		if humanized.abandonTrip then
-			clearTrip(self)
-			self.locomotionStatus = "failed"
+			self.loco:cancel("goalInvalid", now)
+			self.forcedGoal = nil
 			self.brain:onSystemEvent("goalInvalid", now, nil)
 		end
 	end
 
-	if self.jumpRequested and body.onGround then
+	-- 4. Mimic shaping toward the crowd's speeds (near tier only), or an idle fragment replay.
+	local mimic = self.deps.mimic
+	if mimic and self.tier == "near" and command.mode == "move" then
+		command = mimic:shape(command, { rng = self.mimicRng, moving = moving, profileMagnitude = command.magnitude })
+	end
+	if self.deps.traces then
+		local idle = self.loco:status() == "idle" and now >= self.loco.stepUntil
+		command = playFragment(self, command, body, now, idle)
+	end
+
+	-- 5. Jump and facing requests survive whatever replaced the command.
+	local base = out.command
+	if base.jump and not command.jump then
 		command = table.clone(command)
 		command.jump = true
 	end
-	self.jumpRequested = false
-	if self.facingYaw and command.mode ~= "move" then
+	if base.facingYaw and command.mode ~= "move" and command.facingYaw == nil then
 		command = table.clone(command)
-		command.facingYaw = self.facingYaw
-		self.facingYaw = nil
-	elseif self.facingYaw then
-		self.facingYaw = nil
+		command.facingYaw = base.facingYaw
 	end
 
-	-- Emotes are cancelled by movement.
-	if command.mode == "move" and now < self.emoteUntil then
+	-- 6. Far tiers walk by moveTo.
+	if quiet then
+		command = toMoveTo(self, command, body, now)
+	end
+
+	-- 7. Emotes are cancelled by movement.
+	if command.mode ~= "stop" and now < self.emoteUntil then
 		self.deps.presenter:emote(self.id, nil, nil)
 		self.emoteUntil = -math.huge
 	end
@@ -617,10 +828,11 @@ function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 	if command.mode == "move" then
 		self.distanceWalked += body.walkSpeed * command.magnitude * dt
 	end
-	return self:report(command, if brainOut then brainOut.intent.kind else "-", eventsOut)
+	self.lastLocomotion = self.loco:brainView(body).status
+	return self:report(command, if brainOut then brainOut.intent.kind else "-", eventsOut, brainOut ~= nil)
 end
 
-function Npc.report(self: NpcT, command: MoveCommand, intent: string, events: { string }): Report
+function Npc.report(self: NpcT, command: MoveCommand, intent: string, events: { string }, brainRan: boolean?): Report
 	local d = self.brain:describe()
 	local body = self.lastBody
 	return {
@@ -633,9 +845,14 @@ function Npc.report(self: NpcT, command: MoveCommand, intent: string, events: { 
 		target = d.target,
 		mood = d.mood,
 		phase = d.phase,
-		locomotion = self.locomotionStatus,
-		recoveryLevel = self.recovery:currentLevel(),
+		locomotion = self.lastLocomotion,
+		recoveryLevel = self.loco:describe().level,
 		events = events,
+		tier = self.tier,
+		typing = self.typing,
+		sitting = self.sitting,
+		resetsUsed = self.resetsUsed,
+		brainRan = brainRan == true,
 	}
 end
 

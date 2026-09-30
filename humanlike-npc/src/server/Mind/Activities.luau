@@ -5,7 +5,10 @@
 -- intents (goto, hold, step, face, jump, follow, freeze) that the locomotion runtime satisfies
 -- and actions (say, emote, leave) that presentation carries out, and they read back a
 -- locomotion report to learn whether they arrived. Timings come from the research's
--- heavy-tailed distributions, drawn on entry so each run differs.
+-- heavy-tailed distributions, drawn on entry so each run differs. Seats are reached through
+-- optional world closures (seatsNear / occupySeat / releaseSeat): a world without them has no
+-- seats and the NPC never sits. This is not the chooser (Goals, Utility, Brain) and not the body.
+-- requires: NavMath, Rng, Timing, Memory, Utility
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -33,13 +36,15 @@ export type Intent = {
 }
 
 export type Action = {
-	kind: string, -- "say" | "emote" | "leave" | "look" | "forceLine"
+	kind: string, -- "say" | "emote" | "leave" | "look" | "forceLine" | "leaveServer" | "sit" | "typing"
 	text: string?,
 	lineId: string?,
-	target: string?,
+	target: string?, -- entity id; for "sit" the seat id (nil = stand up)
 	name: string?,
 	cutAfter: number?,
 	category: string?,
+	point: Vector3?, -- "sit": the seat's floor point
+	on: boolean?, -- "typing": indicator on / off
 }
 
 export type Locomotion = {
@@ -48,7 +53,11 @@ export type Locomotion = {
 	moving: boolean,
 	onGround: boolean,
 	blockedBy: string?,
+	remaining: number?, -- studs still to walk along the path; nil when the caller does not know
 }
+
+-- A structural view of Types.SeatRecord (the id, the floor point in front of the seat, its POI).
+export type Seat = { id: string, position: Vector3, poiId: string? }
 
 export type Context = {
 	now: number,
@@ -57,13 +66,15 @@ export type Context = {
 	persona: any,
 	me: { id: string, position: Vector3, heading: Vector3 },
 	locomotion: Locomotion,
-	world: any, -- Goals.World
+	world: any, -- Goals.World (seatsNear / occupySeat / releaseSeat are optional closures on it)
 	entity: (id: string) -> any?, -- live entity view or nil
 	memory: Memory.Memory,
 	emit: (Intent) -> (),
 	act: (Action) -> (),
 	relieve: (event: string, context: any?) -> (),
-	suppress: { [string]: boolean }, -- overlay suppression this step (fidget, emote, mirror, talk)
+	-- Overlay suppression this step (fidget, emote, mirror, talk) and, from a full AFK, attention:
+	-- the senses then report nothing but system events and lines that name the NPC.
+	suppress: { [string]: boolean },
 	canFollow: (id: string) -> boolean,
 	beginFollow: (id: string) -> (),
 	affinity: (id: string) -> number,
@@ -71,6 +82,9 @@ export type Context = {
 	groupOf: (id: string) -> any?,
 	inGroup: boolean,
 	wakeBurst: boolean?, -- set by Afk on exit; read by Fidget
+	seats: { Seat }?, -- world.seats; nil when the world knows no seats
+	familiarity: number?, -- persona.familiarity (0 newcomer .. 1 veteran)
+	afkStyle: string?, -- persona.afkStyle: "full" (attention off) | "semi" (reaction delays x3)
 }
 
 export type Status = string -- "running" | "success" | "failed"
@@ -162,6 +176,9 @@ registry.IdleStand = {
 }
 
 -- Afk: perfectly still for minutes, an optional wiggle near the idle-kick, then an abrupt wake.
+-- Neither AFK style ever turns: "full" also switches attention off (the senses skip everything
+-- but system events and lines naming the NPC); "semi" keeps noticing, three times slower (the
+-- brain stretches the reaction delays).
 registry.Afk = {
 	name = "Afk",
 	hasTrip = false,
@@ -180,6 +197,9 @@ registry.Afk = {
 		ctx.suppress.emote = true
 		ctx.suppress.mirror = true
 		ctx.suppress.talk = true
+		if ctx.afkStyle == "full" then
+			ctx.suppress.attention = true
+		end
 		ctx.relieve("afkTick", { dt = ctx.dt })
 		if state.wiggleAt and ctx.now >= state.wiggleAt then
 			state.wiggleAt = nil
@@ -206,8 +226,57 @@ registry.Afk = {
 
 local DWELL_DEFAULT: { [string]: number } = { shop = 8, hangout = 25, viewpoint = 12, objective = 6, spawn = 5 }
 local HOVER_CHANCE: { [string]: number } = { shop = 0.4, hangout = 0.2, viewpoint = 0.3, objective = 0.15 }
+local SIT_CHANCE = 0.35 -- times persona.sitHabit, per dwell at a place with a free seat
+local MOBILE_STOP_SCALE = 1.15 -- thumb players stop a little further out
+local OCCUPANT_RADIUS, OCCUPANT_PUSH = 2, 1.5 -- studs: nobody stops on top of someone
+local SIDE_STEP_EVERY, SIDE_STEP_CHANCE = 5, 0.5 -- dwelling: a small shuffle now and then
 
--- VisitPoi: approach off-axis, stop short, maybe hover, then interact or dwell.
+-- Facing a point roughly (within ±jitterDeg): shift-lock profiles turn the body, everyone else
+-- taps a short step toward it, which is the only way a third-person body turns.
+local function faceOrTap(ctx: Context, target: Vector3, jitterDeg: number)
+	if ctx.shiftLock then
+		face(ctx, target, jitterDeg)
+		return
+	end
+	local toward = NavMath.flatDirection(ctx.me.position, target)
+	if toward.Magnitude > 0 then
+		ctx.emit({ kind = "step", dir = toward, duration = 0.2 })
+	end
+end
+
+-- A free seat within the place's radius, taken with p = SIT_CHANCE * sitHabit; nil when the world
+-- has no seat query, no free seat is near, or the roll says stand. Draws only when a seat exists,
+-- so worlds without seats see the same draw sequence as before seats existed.
+local function pickSeat(ctx: Context, poi: any): Seat?
+	local world = ctx.world
+	if type(world.seatsNear) ~= "function" or type(world.occupySeat) ~= "function" then
+		return nil
+	end
+	local free: { Seat } = world.seatsNear(poi.position, poi.radius or 6)
+	if #free == 0 then
+		return nil
+	end
+	local sitHabit = ctx.persona.sitHabit or 0
+	if not ctx.rng:chance(SIT_CHANCE * sitHabit) then
+		return nil
+	end
+	return free[1]
+end
+
+local function standUp(ctx: Context, state: any)
+	if not state.seated then
+		return
+	end
+	state.seated = false
+	ctx.act({ kind = "sit", target = nil })
+	local seat = state.seat
+	if seat and type(ctx.world.releaseSeat) == "function" then
+		ctx.world.releaseSeat(seat.id, ctx.me.id)
+	end
+end
+
+-- VisitPoi: approach off-axis, stop short (further on a phone, never on top of someone), face
+-- the place roughly, maybe hover, then interact or dwell, sitting down when a seat is free.
 registry.VisitPoi = {
 	name = "VisitPoi",
 	hasTrip = true,
@@ -231,16 +300,35 @@ registry.VisitPoi = {
 		else
 			stopDist = u(rng, 0.3, 0.8) * (poi.radius or 6)
 		end
+		local profile = ctx.persona.profile
+		if profile and profile.kind == "mobile" then
+			stopDist *= MOBILE_STOP_SCALE
+		end
+		local target = poi.position + approach * stopDist
+		-- Pushed off anyone already standing on the stop point.
+		for _, e in ctx.world.entities do
+			if NavMath.flatDistance(e.position, target) < OCCUPANT_RADIUS then
+				local away = NavMath.flatDirection(e.position, target)
+				if away.Magnitude == 0 then
+					away = approach
+				end
+				target = target + away * OCCUPANT_PUSH
+				break
+			end
+		end
 		return {
 			poi = poi,
 			approach = approach,
-			target = poi.position + approach * stopDist,
+			target = target,
 			phase = "approach",
 			hovers = if rng:chance(HOVER_CHANCE[kind] or 0.2) then rng:int(1, 3) else 0,
 			hoverTarget = nil,
 			phaseUntil = 0,
 			interactions = 0,
 			interactionsLeft = 0,
+			seat = nil,
+			seated = false,
+			nextSideStepAt = 0,
 		}
 	end,
 	tick = function(ctx, state)
@@ -252,6 +340,9 @@ registry.VisitPoi = {
 			if r == "failed" then
 				return "failed"
 			elseif r == "arrived" then
+				if rng:chance(0.6) then
+					faceOrTap(ctx, poi.position, 30)
+				end
 				state.phase = if state.hovers > 0 then "hover" else "decide"
 			end
 			return "running"
@@ -285,12 +376,36 @@ registry.VisitPoi = {
 			elseif kind == "shop" or kind == "objective" then
 				state.phase = "interact"
 				state.interactionsLeft = Timing.geometric(rng, 0.4, 1, 10)
-				state.sub = "read"
-				state.phaseUntil = ctx.now + u(rng, 0.3, 1.5)
+				-- A beat before the first interaction: nobody presses the prompt on arrival.
+				state.sub = "pause"
+				state.phaseUntil = ctx.now + rng:logNormalClamped(0.7, 0.5, 0.3, 1.5)
 			else
 				state.phase = "dwell"
 				local median = poi.dwellMedian or DWELL_DEFAULT[kind] or 10
 				state.phaseUntil = ctx.now + rng:logNormalClamped(median, 0.8, 1, 300)
+				state.nextSideStepAt = ctx.now + SIDE_STEP_EVERY
+				local seat = pickSeat(ctx, poi)
+				if seat then
+					state.seat = seat
+					state.phase = "toSeat"
+				end
+			end
+			return "running"
+		elseif state.phase == "toSeat" then
+			-- Walk to the seat; taken on arrival (someone was quicker) means dwelling on foot.
+			local seat: Seat = state.seat
+			local r = gotoStep(ctx, seat.position, { stopDistance = 0.3, tolerance = 1.2, urgency = 0.4 })
+			if r == "arrived" then
+				if ctx.world.occupySeat(seat.id, ctx.me.id) == true then
+					state.seated = true
+					ctx.act({ kind = "sit", target = seat.id, point = seat.position })
+				else
+					state.seat = nil
+				end
+				state.phase = "dwell"
+			elseif r == "failed" then
+				state.seat = nil
+				state.phase = "dwell"
 			end
 			return "running"
 		elseif state.phase == "lookAndLeave" then
@@ -298,8 +413,14 @@ registry.VisitPoi = {
 			face(ctx, poi.position, 30)
 			return if ctx.now >= state.phaseUntil then "success" else "running"
 		elseif state.phase == "interact" then
-			-- read the prompt -> hold the key -> watch the result -> shuffle -> maybe check inventory
-			if state.sub == "read" then
+			-- pause -> read the prompt -> hold the key -> watch the result -> shuffle -> maybe check inventory
+			if state.sub == "pause" then
+				hold(ctx)
+				if ctx.now >= state.phaseUntil then
+					state.sub = "read"
+					state.phaseUntil = ctx.now + u(rng, 0.3, 1.5)
+				end
+			elseif state.sub == "read" then
 				hold(ctx)
 				face(ctx, poi.position, 30)
 				if ctx.now >= state.phaseUntil then
@@ -347,11 +468,27 @@ registry.VisitPoi = {
 			return "running"
 		elseif state.phase == "dwell" then
 			hold(ctx)
+			if state.seated then
+				ctx.suppress.fidget = true
+			elseif ctx.now >= state.nextSideStepAt then
+				-- Standing around: a small shuffle sideways now and then.
+				state.nextSideStepAt = ctx.now + SIDE_STEP_EVERY
+				if rng:chance(SIDE_STEP_CHANCE) then
+					local studs = u(rng, 0.3, 0.8)
+					ctx.emit({
+						kind = "step",
+						dir = NavMath.perp(ctx.me.heading) * rng:sign(),
+						duration = studs / (ctx.persona.walkSpeed or 16),
+					})
+				end
+			end
 			return if ctx.now >= state.phaseUntil then "success" else "running"
 		end
 		return "failed"
 	end,
 	stop = function(ctx, state, outcome)
+		-- The next trip starts on foot: stand up and free the seat whatever the outcome.
+		standUp(ctx, state)
 		if outcome == "success" then
 			Memory.recordVisit(ctx.memory, state.poi.id, ctx.now)
 			local kind = state.poi.kind
@@ -560,19 +697,20 @@ registry.JoinGroup = {
 	stop = function() end,
 }
 
--- Watch: stand a few studs from someone and look.
+-- Watch: stand a few studs from someone (data.entityId) or from a spot (data.position, a game
+-- event) and look.
 registry.Watch = {
 	name = "Watch",
 	hasTrip = true,
 	start = function(ctx, candidate)
-		local id = candidate.data.entityId
-		local target = ctx.entity(id)
-		local at = if target then target.position else ctx.me.position
+		local id: string? = candidate.data.entityId
+		local target = if id then ctx.entity(id) else nil
+		local at: Vector3 = if target then target.position else (candidate.data.position or ctx.me.position)
 		local dir = NavMath.flatDirection(at, ctx.me.position)
 		if dir.Magnitude == 0 then
 			dir = NavMath.dirFromYaw(ctx.rng:range(0, math.pi * 2))
 		end
-		return { entityId = id, spot = at + dir * u(ctx.rng, 4, 8), phase = "go", until_ = 0 }
+		return { entityId = id, at = at, spot = at + dir * u(ctx.rng, 4, 8), phase = "go", until_ = 0 }
 	end,
 	tick = function(ctx, state)
 		if state.phase == "go" then
@@ -585,9 +723,11 @@ registry.Watch = {
 			end
 			return "running"
 		end
-		local target = ctx.entity(state.entityId)
+		local target = if state.entityId then ctx.entity(state.entityId) else nil
 		if target then
 			face(ctx, target.position, 20)
+		elseif state.entityId == nil then
+			face(ctx, state.at, 20)
 		end
 		hold(ctx)
 		return if ctx.now >= state.until_ then "success" else "running"

@@ -16,6 +16,7 @@
 -- Geometry is the block-rig silhouette computed from HipHeight 2 and the root's half height 1
 -- (feet at -3 below the root centre): a 2-stud torso, 2-stud limbs, a 1.2 cube head. The engine
 -- animator needs the joint names, the part hierarchy and HipHeight, not exact package sizes.
+-- requires: AvatarCatalog, Types
 
 local Types = require(script.Parent.Parent.Types)
 local AvatarCatalog = require(script.Parent.AvatarCatalog)

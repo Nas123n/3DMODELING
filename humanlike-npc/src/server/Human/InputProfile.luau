@@ -5,6 +5,7 @@
 -- other humanization module reads these numbers instead of inventing its own wobble, so two
 -- mobile NPCs differ only by the small jitter applied when the profile is sampled, and a PC NPC
 -- never shows thumbstick tremor.
+-- requires: Rng
 
 local Rng = require(script.Parent.Parent.Rng)
 

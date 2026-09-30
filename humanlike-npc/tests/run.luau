@@ -39,6 +39,9 @@ local suites = {
 	require("./PrimitiveRig.spec"),
 	require("./Mimic.spec"),
 	require("./Safety.spec"),
+	require("./Shared.spec"),
+	require("./Npc.spec"),
+	require("./LoadAll.spec"),
 	require("./Integration.spec"),
 }
 

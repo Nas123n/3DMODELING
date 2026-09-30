@@ -5,6 +5,7 @@
 -- finished, which map sectors it has explored, and where it recently got stuck so goals and
 -- the path provider steer clear. forget() prunes on a 10 s cadence so memory per NPC stays
 -- under a few kilobytes. Nothing here is ever replayed verbatim as speech.
+-- requires: (none)
 
 local Memory = {}
 

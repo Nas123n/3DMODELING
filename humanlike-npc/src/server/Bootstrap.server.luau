@@ -1,3 +1,4 @@
 --!strict
 -- Placeholder: replaced by the real bootstrap once the service exists. Kept so the Rojo tree
 -- and the Lune loader always have every mapped path present.
+-- requires: (none)

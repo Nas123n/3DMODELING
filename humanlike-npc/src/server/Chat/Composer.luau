@@ -7,6 +7,7 @@
 -- candidates: a dialect-tagged line is only for that dialect, rude / poi / needsName / right /
 -- help.right lines need the matching context, and the help sub-tags share 60 / 25 / 15. This is
 -- not the reply decision (Reply), the rate limit (ChatGuard) or the corpus itself (ChatCorpus).
+-- requires: ChatCorpus, ChatStyle, Recency, Rng, Safety
 
 local ChatCorpus = require(script.Parent.ChatCorpus)
 local ChatStyle = require(script.Parent.ChatStyle)

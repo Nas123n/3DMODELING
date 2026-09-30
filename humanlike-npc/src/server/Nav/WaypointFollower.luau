@@ -7,6 +7,7 @@
 -- walks toward what they can see, handles Jump waypoints as a small state machine with retries,
 -- notices timeouts, and exposes the hooks the humanizer needs: offset a corner, move the final
 -- stop point, rewind the walked polyline for an about-face.
+-- requires: NavMath, Types
 
 local NavMath = require(script.Parent.NavMath)
 local Types = require(script.Parent.Parent.Types)

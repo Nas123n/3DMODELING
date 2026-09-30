@@ -1,8 +1,14 @@
 return function(T, Loader)
+	local roblox = require("@lune/roblox")
+	local Vector3 = roblox.Vector3
 	local session = Loader.new()
 	local Rng = session.require(session.game.ServerStorage.HumanlikeNpc.Rng)
 	local Personality = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.Personality)
 	local SocialGuard = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.SocialGuard)
+	local Memory = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.Memory)
+	local Utility = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.Utility)
+	local Goals = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.Goals)
+	local Activities = session.require(session.game.ServerStorage.HumanlikeNpc.Mind.Activities)
 	local Safety = session.require(session.game.ServerStorage.HumanlikeNpc.Chat.Safety)
 	local Recency = session.require(session.game.ServerStorage.HumanlikeNpc.Chat.Recency)
 	local Reply = session.require(session.game.ServerStorage.HumanlikeNpc.Chat.Reply)
@@ -390,6 +396,552 @@ return function(T, Loader)
 			T.check(guard:relation("p1", 200).annoyance > 0.5)
 			guard:decay(1200)
 			T.check(guard:relation("p1", 1200).annoyance < 0.2, "annoyance fades")
+		end)
+
+		T.it("rude lines go to a player at most once", function()
+			local guard = SocialGuard.new()
+			T.check(not guard:wasRudeTo("p1"), "nothing said yet")
+			guard:saidTo("p1", 10, true)
+			T.check(not guard:wasRudeTo("p1"), "an ordinary line is not rude")
+			T.equal(guard:relation("p1", 10).rudeAt, nil)
+			guard:saidTo("p1", 20, true, true)
+			T.check(guard:wasRudeTo("p1"), "a rude line is remembered")
+			T.equal(guard:relation("p1", 20).rudeAt, 20)
+			T.check(not guard:wasRudeTo("p2"), "per person")
+			guard:decay(5000)
+			T.check(guard:wasRudeTo("p1"), "never fades within the session")
+			guard:saidTo("p1", 6000, false, false)
+			T.check(guard:wasRudeTo("p1"), "a later ordinary line does not clear it")
+			guard:forget("p1")
+			T.check(not guard:wasRudeTo("p1"), "forgotten with the relation")
+		end)
+	end)
+
+	-- A flat world view for Goals and Utility: places on a ring, no entities, everything reachable.
+	local function flatWorld(pois, overrides)
+		local world = {
+			pois = pois or {},
+			poiOccupants = function()
+				return 0
+			end,
+			entities = {},
+			visible = {},
+			groups = {},
+			myGroup = nil,
+			spawnPoint = Vector3.zero,
+			reachable = function()
+				return true
+			end,
+			randomReachable = function(from, minDistance)
+				return from + Vector3.new(minDistance + 5, 0, 0)
+			end,
+			sectorCenter = function()
+				return Vector3.new(20, 0, 20)
+			end,
+			nearbySectors = function()
+				return { "1:1" }
+			end,
+			totalSectors = 100,
+			isAvoided = function()
+				return false
+			end,
+			failedRecently = function()
+				return false
+			end,
+			props = nil,
+		}
+		for k, v in overrides or {} do
+			world[k] = v
+		end
+		return world
+	end
+
+	local function goalsContext(persona, world, overrides)
+		local ctx = {
+			me = { id = "npc1", position = Vector3.zero, heading = Vector3.new(0, 0, -1) },
+			persona = persona,
+			memory = Memory.new(0),
+			phase = "settled",
+			mood = "neutral",
+			now = 1000,
+			rng = Rng.new(77),
+			world = world,
+			relations = {},
+			canFollow = function()
+				return true
+			end,
+			attachment = nil,
+			favoritePoiKind = nil,
+			fatigue = 0.2,
+		}
+		for k, v in overrides or {} do
+			ctx[k] = v
+		end
+		return ctx
+	end
+
+	local function utilityContext(persona, needs)
+		return {
+			persona = persona,
+			needs = needs,
+			mood = "neutral",
+			phase = "settled",
+			now = 1000,
+			lastEnd = function()
+				return nil
+			end,
+		}
+	end
+
+	local function find(candidates, activity, target)
+		for _, c in candidates do
+			if c.activity == activity and (target == nil or c.target == target) then
+				return c
+			end
+		end
+		return nil
+	end
+
+	T.describe("Utility", function()
+		T.it("need(Afk) is 0.5 + 0.5 fatigue so AFK is reachable in an ordinary session", function()
+			local function needs(fatigue)
+				return { boredom = 0, social = 0, purpose = 0, fatigue = fatigue, novelty = 0 }
+			end
+			T.near(Utility.need("Afk", needs(0)), 0.5, 1e-9)
+			T.near(Utility.need("Afk", needs(0.5)), 0.75, 1e-9)
+			T.near(Utility.need("Afk", needs(1)), 1.0, 1e-9)
+			T.equal(Utility.need("Leave", needs(1)), 1)
+			T.near(Utility.need("IdleStand", needs(0)), 0.45, 1e-9, "the idle floor is untouched")
+			T.equal(Utility.sensitivity("gameEvent", { sociability = 0, curiosity = 0 }), 2.0, "a system event")
+		end)
+	end)
+
+	T.describe("Goals", function()
+		T.it("newcomers explore more", function()
+			local persona = Personality.sample(Rng.new(3))
+			local needs = { boredom = 0.5, social = 0.2, purpose = 0.5, fatigue = 0.1, novelty = 0.6 }
+			local function exploreScore(familiarity)
+				local ctx = goalsContext(persona, flatWorld({}), { familiarity = familiarity })
+				local c = find(Goals.candidates(ctx), "Explore")
+				T.check(c ~= nil, "an Explore candidate exists")
+				return Utility.scoreOne(utilityContext(persona, needs), c)
+			end
+			local newcomer, veteran = exploreScore(0.05), exploreScore(0.95)
+			T.check(newcomer / veteran >= 1.6, `ratio {newcomer / veteran}`)
+			local unscaled = exploreScore(nil)
+			T.near(unscaled, exploreScore(1), 1e-9, "no familiarity given behaves like a veteran")
+		end)
+
+		T.it("restlessness and the pointless share shape Wander and Pace", function()
+			local persona = Personality.sample(Rng.new(4))
+			persona.restlessness = 1
+			persona.pointlessTarget = 0.5
+			local ctx = goalsContext(persona, flatWorld({}))
+			local candidates = Goals.candidates(ctx)
+			local wanders = {}
+			for _, c in candidates do
+				if c.activity == "Wander" then
+					table.insert(wanders, c.ctx)
+				end
+			end
+			T.equal(#wanders, 2)
+			T.near(wanders[1], 1.25 * 1.4, 1e-9, "biased half of 2.5, restless x1.4")
+			T.near(wanders[2], 1.25 * 1.4, 1e-9, "pointless half of 2.5, restless x1.4")
+			T.near(find(candidates, "Pace").ctx, 1.4, 1e-9)
+			-- A calm persona without the traits keeps the landed 1.5 / 1 split and factor 1.
+			local plain = Personality.sample(Rng.new(4))
+			plain.restlessness = nil
+			plain.pointlessTarget = nil
+			local plainCandidates = Goals.candidates(goalsContext(plain, flatWorld({})))
+			local plainWanders = {}
+			for _, c in plainCandidates do
+				if c.activity == "Wander" then
+					table.insert(plainWanders, c.ctx)
+				end
+			end
+			T.near(plainWanders[1], 1.5, 1e-9)
+			T.near(plainWanders[2], 1, 1e-9)
+			T.near(find(plainCandidates, "Pace").ctx, 1, 1e-9)
+		end)
+
+		T.it("a hangout with a free seat pulls harder on someone who likes to sit", function()
+			local persona = Personality.sample(Rng.new(5))
+			persona.sitHabit = 1
+			local hangout = { id = "h", kind = "hangout", position = Vector3.new(20, 0, 0), weight = 1, radius = 6 }
+			local plain = find(Goals.candidates(goalsContext(persona, flatWorld({ hangout }))), "VisitPoi", "h")
+			local seated = find(
+				Goals.candidates(goalsContext(
+					persona,
+					flatWorld({ hangout }, {
+						seatsNear = function()
+							return { { id = "bench", position = Vector3.new(22, 0, 0), poiId = "h" } }
+						end,
+					})
+				)),
+				"VisitPoi",
+				"h"
+			)
+			T.near(seated.ctx / plain.ctx, 1.3, 1e-9)
+		end)
+
+		T.it("a game event adds the nearest objective (bonus 2) and a watch of the spot (bonus 1)", function()
+			local persona = Personality.sample(Rng.new(6))
+			local pois = {
+				{ id = "far", kind = "objective", position = Vector3.new(200, 0, 0), weight = 1, radius = 6 },
+				{ id = "near", kind = "objective", position = Vector3.new(40, 0, 0), weight = 1, radius = 6 },
+				{ id = "h", kind = "hangout", position = Vector3.new(10, 0, 0), weight = 1, radius = 6 },
+			}
+			local at = Vector3.new(45, 0, 5)
+			local ctx = goalsContext(persona, flatWorld(pois))
+			local ev = { kind = "gameEvent", salience = 1, at = 1000, data = { position = at, magnitude = 1 } }
+			local candidates = Goals.candidates(ctx, ev)
+			local objective = find(candidates, "VisitPoi", "near")
+			T.check(objective ~= nil, "the nearest objective is a candidate")
+			T.equal(objective.bonus, 2.0)
+			T.equal(find(candidates, "VisitPoi", "far").bonus, nil, "only the nearest gets the bonus")
+			local watch = find(candidates, "Watch", "event")
+			T.check(watch ~= nil, "a watch toward the spot")
+			T.equal(watch.bonus, 1.0)
+			T.equal(watch.data.position, at)
+			-- Without a position there is no watch, and the objective bonus goes by my position.
+			local noSpot = Goals.candidates(ctx, { kind = "gameEvent", salience = 1, at = 1000, data = {} })
+			T.equal(find(noSpot, "Watch", "event"), nil)
+			T.equal(find(noSpot, "VisitPoi", "near").bonus, 2.0)
+		end)
+	end)
+
+	T.describe("Activities", function()
+		local HEADING = Vector3.new(0, 0, -1)
+
+		local function flatDistance(a, b)
+			local dx, dz = a.X - b.X, a.Z - b.Z
+			return math.sqrt(dx * dx + dz * dz)
+		end
+
+		-- One activity under a scripted body: a goto walks for one tick and arrives on the next,
+		-- teleporting the body to the goal; everything else idles. Returns the outcome plus every
+		-- intent and action seen.
+		local function runActivity(seed, name, candidate, opts)
+			local o = opts or {}
+			local persona = Personality.sample(Rng.new(seed), { profileKind = o.profileKind })
+			for k, v in o.persona or {} do
+				persona[k] = v
+			end
+			local loco = { status = "idle", goal = nil, moving = false, onGround = true, blockedBy = nil }
+			local me = { id = "npc1", position = Vector3.zero, heading = HEADING }
+			local world = flatWorld(o.pois or {}, o.world)
+			local step = {}
+			local intents, actions = {}, {}
+			local ctx = {
+				now = 0,
+				dt = 0.5,
+				rng = Rng.new(seed + 5000),
+				persona = persona,
+				me = me,
+				locomotion = loco,
+				world = world,
+				entity = function()
+					return nil
+				end,
+				memory = Memory.new(0),
+				emit = function(i)
+					table.insert(step, i)
+					table.insert(intents, i)
+				end,
+				act = function(a)
+					table.insert(actions, a)
+				end,
+				relieve = function() end,
+				suppress = {},
+				canFollow = function()
+					return true
+				end,
+				beginFollow = function() end,
+				affinity = function()
+					return 0
+				end,
+				shiftLock = persona.profile.strafes,
+				groupOf = function()
+					return nil
+				end,
+				inGroup = false,
+				familiarity = persona.familiarity,
+				afkStyle = persona.afkStyle,
+			}
+			local activity = Activities.get(name)
+			local state = activity.start(ctx, candidate)
+			local status = "running"
+			local steps = 0
+			while status == "running" do
+				steps += 1
+				if steps > 4000 then
+					error(`{name} did not finish`)
+				end
+				ctx.now += ctx.dt
+				ctx.suppress = {}
+				table.clear(step)
+				status = activity.tick(ctx, state)
+				local travel = nil
+				for _, i in step do
+					if i.kind == "goto" then
+						travel = i
+					end
+				end
+				if travel then
+					if loco.goal and flatDistance(loco.goal, travel.position) < 0.5 then
+						loco.status = "arrived"
+						loco.moving = false
+						me.position = travel.position
+					else
+						loco.goal = travel.position
+						loco.status = "walking"
+						loco.moving = true
+					end
+				else
+					loco.status = "idle"
+					loco.goal = nil
+					loco.moving = false
+				end
+			end
+			activity.stop(ctx, state, status)
+			return { status = status, intents = intents, actions = actions, state = state, seconds = ctx.now }
+		end
+
+		local function hangout(extra)
+			local poi = { id = "h1", kind = "hangout", position = Vector3.new(0, 0, -20), weight = 1, radius = 6 }
+			for k, v in extra or {} do
+				poi[k] = v
+			end
+			return poi
+		end
+
+		T.it("visit stops short and faces", function()
+			local stopSum, faced, n = 0, 0, 200
+			for seed = 1, n do
+				local poi = hangout({ dwellMedian = 2 })
+				local r = runActivity(seed, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+					profileKind = "pcShiftLock",
+					pois = { poi },
+				})
+				T.equal(r.status, "success", `seed {seed}`)
+				local firstGoto, sawFace = nil, false
+				for _, i in r.intents do
+					if i.kind == "goto" and not firstGoto then
+						firstGoto = i
+					elseif i.kind == "face" then
+						sawFace = true
+					end
+				end
+				T.check(firstGoto ~= nil, "a trip was made")
+				stopSum += flatDistance(firstGoto.position, poi.position)
+				if sawFace then
+					faced += 1
+				end
+			end
+			T.check(stopSum / n >= 1.5, `mean stop distance {stopSum / n}`)
+			T.between(faced / n, 0.5, 0.7, `face share {faced / n}`)
+		end)
+
+		T.it("mobile players stop further out and nobody stops on top of someone", function()
+			local poi = hangout()
+			local function firstStop(seed, profileKind, entities)
+				local r = runActivity(seed, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+					profileKind = profileKind,
+					pois = { poi },
+					world = { entities = entities or {} },
+				})
+				for _, i in r.intents do
+					if i.kind == "goto" then
+						return flatDistance(i.position, poi.position)
+					end
+				end
+				return nil
+			end
+			-- Same seed, same draws: the phone stops 15 % further out.
+			local pc, mobile = firstStop(11, "pc"), firstStop(11, "mobile")
+			T.near(mobile / pc, 1.15, 1e-6)
+			T.between(pc, 1.8, 4.8, "hangout stop distance u(0.3, 0.8) x radius 6")
+			-- Someone standing on the stop point pushes it 1.5 studs away from them.
+			local plain = runActivity(12, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+				profileKind = "pc",
+				pois = { poi },
+			})
+			local plainStop = nil
+			for _, i in plain.intents do
+				if i.kind == "goto" then
+					plainStop = i.position
+					break
+				end
+			end
+			local occupant = {
+				id = "p:1",
+				kind = "player",
+				position = plainStop + Vector3.new(0.5, 0, 0),
+				velocity = Vector3.zero,
+				yaw = 0,
+				displayName = "Zoe",
+			}
+			local pushed = runActivity(12, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+				profileKind = "pc",
+				pois = { poi },
+				world = { entities = { occupant } },
+			})
+			local pushedStop = nil
+			for _, i in pushed.intents do
+				if i.kind == "goto" then
+					pushedStop = i.position
+					break
+				end
+			end
+			T.near(flatDistance(pushedStop, plainStop), 1.5, 1e-6, "moved 1.5 studs")
+			T.check(flatDistance(pushedStop, occupant.position) > flatDistance(plainStop, occupant.position), "away")
+		end)
+
+		T.it("sits when a free seat is near", function()
+			local seat = { id = "bench", position = Vector3.new(3, 0, -20), poiId = "h1" }
+			local function seatedWorld(startOccupied, listWhenOccupied)
+				local occupied = startOccupied
+				return {
+					seatsNear = function(position, radius)
+						T.check(radius == 6, "the POI radius")
+						T.check(position == Vector3.new(0, 0, -20), "the POI position")
+						if occupied and not listWhenOccupied then
+							return {}
+						end
+						return { seat }
+					end,
+					occupySeat = function(id, who)
+						T.equal(id, "bench")
+						T.equal(who, "npc1")
+						if occupied then
+							return false
+						end
+						occupied = true
+						return true
+					end,
+					releaseSeat = function(id, who)
+						T.equal(id, "bench")
+						T.equal(who, "npc1")
+						occupied = false
+					end,
+				}
+			end
+			local sits, n = 0, 400
+			for seed = 1, n do
+				local poi = hangout({ dwellMedian = 2 })
+				local r = runActivity(seed, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+					persona = { sitHabit = 1 },
+					pois = { poi },
+					world = seatedWorld(false, false),
+				})
+				local sat, stood = false, false
+				for _, a in r.actions do
+					if a.kind == "sit" and a.target == "bench" then
+						sat = true
+						T.equal(a.point, seat.position)
+					elseif a.kind == "sit" and a.target == nil then
+						stood = true
+					end
+				end
+				if sat then
+					sits += 1
+					T.check(stood, "stands up again when the visit ends")
+					T.check(not r.state.seated, "released")
+				else
+					T.check(not stood, "no stand without a sit")
+				end
+			end
+			T.between(sits / n, 0.28, 0.42, `sit share {sits / n}`)
+			-- The seat is taken: never, whether the registry hides it or occupySeat says no.
+			for _, listed in { false, true } do
+				local taken = 0
+				for seed = 1, 100 do
+					local poi = hangout({ dwellMedian = 2 })
+					local r = runActivity(seed, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+						persona = { sitHabit = 1 },
+						pois = { poi },
+						world = seatedWorld(true, listed),
+					})
+					for _, a in r.actions do
+						if a.kind == "sit" then
+							taken += 1
+						end
+					end
+				end
+				T.equal(taken, 0, `occupied seat listed={listed}`)
+			end
+			-- A world without a seat query never sits and draws nothing extra.
+			local none = 0
+			for seed = 1, 50 do
+				local poi = hangout({ dwellMedian = 2 })
+				local r = runActivity(seed, "VisitPoi", { activity = "VisitPoi", target = poi.id, data = poi }, {
+					persona = { sitHabit = 1 },
+					pois = { poi },
+				})
+				for _, a in r.actions do
+					if a.kind == "sit" then
+						none += 1
+					end
+				end
+			end
+			T.equal(none, 0)
+		end)
+
+		T.it("a full AFK switches attention off, a semi AFK does not, and neither ever turns", function()
+			for _, style in { "full", "semi" } do
+				local persona = Personality.sample(Rng.new(21), { profileKind = "pcShiftLock" })
+				persona.afkStyle = style
+				local sawAttention, faces = false, 0
+				local r = runActivity(21, "Afk", { activity = "Afk", distance = 0 }, {
+					profileKind = "pcShiftLock",
+					persona = { afkStyle = style, afkProneness = 0.5 },
+				})
+				for _, i in r.intents do
+					if i.kind == "face" then
+						faces += 1
+					end
+				end
+				T.equal(faces, 0, `{style}: no turning`)
+				T.equal(r.status, "success")
+				-- The suppression flag is set every tick: check one tick directly.
+				local ctx = {
+					now = 0,
+					dt = 0.5,
+					rng = Rng.new(1),
+					persona = persona,
+					me = { id = "npc1", position = Vector3.zero, heading = HEADING },
+					locomotion = { status = "idle", goal = nil, moving = false, onGround = true },
+					world = flatWorld({}),
+					entity = function()
+						return nil
+					end,
+					memory = Memory.new(0),
+					emit = function() end,
+					act = function() end,
+					relieve = function() end,
+					suppress = {},
+					canFollow = function()
+						return true
+					end,
+					beginFollow = function() end,
+					affinity = function()
+						return 0
+					end,
+					shiftLock = true,
+					groupOf = function()
+						return nil
+					end,
+					inGroup = false,
+					afkStyle = style,
+				}
+				local afk = Activities.get("Afk")
+				local state = afk.start(ctx, { activity = "Afk", distance = 0 })
+				ctx.now = 1
+				afk.tick(ctx, state)
+				sawAttention = ctx.suppress.attention == true
+				T.equal(sawAttention, style == "full", `{style}: attention flag`)
+				T.check(ctx.suppress.fidget and ctx.suppress.talk, "still and silent")
+			end
 		end)
 	end)
 end

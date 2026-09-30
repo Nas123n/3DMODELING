@@ -7,9 +7,13 @@
 -- (stand still, a first jump or camera spin, maybe "hi", then a short first walk) runs instead
 -- of selection during the joining phase. A walking NPC very occasionally changes its mind
 -- (random abandonment, at most once per trip, never right after deciding or with the goal in
--- sight); the step that drops a trip is flagged `changedMind`. In the far and dormant tiers the
--- brain keeps choosing trips but skips overlays and every reaction that is not a system event.
--- It is not the body: locomotion, path planning and the humanizer live in Nav/ and Runtime/.
+-- sight); the step that drops a trip is flagged `changedMind`. The first trip after the ritual is
+-- always short (nearest place or group, or a wander). In the far and dormant tiers the brain
+-- keeps choosing trips but skips overlays and every reaction that is not a system event. The
+-- runtime reports what happened to the body (stuck, fell, flung, pushed into a no-go area, a
+-- game event) through onSystemEvent, each with its own rule. It is not the body: locomotion,
+-- path planning and the humanizer live in Nav/ and Runtime/.
+-- requires: Rng, Needs, Mood, Memory, Reaction, Session, Goals, Utility, Activities, Overlays, SocialGuard, NavMath
 
 local Rng = require(script.Parent.Parent.Rng)
 local Needs = require(script.Parent.Needs)
@@ -34,16 +38,10 @@ type Event = Reaction.Event
 local Brain = {}
 Brain.__index = Brain
 
--- Activities.Locomotion plus the distance still to walk (studs along the path; nil when the
--- caller does not know, which never blocks an abandonment).
-export type Locomotion = {
-	status: string, -- "idle" | "planning" | "walking" | "arrived" | "failed"
-	goal: Vector3?,
-	moving: boolean,
-	onGround: boolean,
-	blockedBy: string?,
-	remaining: number?,
-}
+-- The locomotion report, including the distance still to walk (studs along the path; nil when
+-- the caller does not know, which never blocks an abandonment). Kept as an alias so callers that
+-- named Brain.Locomotion keep working.
+export type Locomotion = Activities.Locomotion
 
 export type Input = {
 	now: number,
@@ -60,6 +58,9 @@ export type Input = {
 	fellNearby: boolean?,
 	tier: string?, -- "near" | "mid" | "far" | "dormant" (Types.Tier); nil behaves as near
 	poiWord: string?, -- kind word of the POI the NPC stands at, handed to the talk overlay
+	reading: boolean?, -- senses:isReading(now): the reading pause overlay
+	nearest: Overlays.Nearest?, -- the closest standing neighbour: the step-away overlay
+	platformFreezes: boolean?, -- false when this place's chat never takes the movement keys
 }
 
 export type Output = {
@@ -72,6 +73,7 @@ export type Output = {
 	phase: string,
 	mood: string,
 	changedMind: boolean?, -- true on the step where the brain dropped a running trip
+	attentionOff: boolean?, -- a full AFK: pass it to the senses as attentionOff next step
 }
 
 export type BrainT = typeof(setmetatable(
@@ -103,6 +105,11 @@ export type BrainT = typeof(setmetatable(
 		excluded: { [string]: number }, -- target -> until
 		wakeBurst: boolean,
 		lastTripEndedAt: number,
+		firstTripChosen: boolean, -- the first trip after the ritual is restricted (DR-37)
+		attentionOff: boolean, -- suppress.attention of the last step (a full AFK)
+		deferredReselectAt: number, -- flung: choose again once the body's hold is over
+		override: { position: Vector3, until_: number }?, -- avoidExit: walk here before anything else
+		queuedActions: { Action }, -- raised by system events, delivered on the next step
 	},
 	Brain
 ))
@@ -134,6 +141,22 @@ local QUIET_ACTIVITIES: { [string]: boolean } = {
 -- Never abandon a trip in its first seconds or once the goal is this close.
 local ABANDON_MIN_TRIP_SECONDS = 3
 local ABANDON_MIN_REMAINING = 8
+
+-- The first trip after the ritual: the nearest place within this range (bonus 3), the nearest
+-- group (bonus 0.5 per member), a wander (Goals draws it within 40 studs) or standing still.
+local FIRST_TRIP_POI_RANGE = 60
+local FIRST_TRIP_POI_BONUS = 3
+local FIRST_TRIP_GROUP_BONUS_PER_MEMBER = 0.5
+local FIRST_SELECTION_ALWAYS: { [string]: boolean } =
+	{ IdleStand = true, Wander = true, Leave = true, ReactProbe = true }
+
+-- A semi-AFK player notices things, three times later.
+local SEMI_AFK_DELAY_SCALE = 3
+-- Flung: seconds of the locomotion hold when the runtime does not say (LNc(2, 0.5, 1, 5) median).
+local FLUNG_HOLD_DEFAULT = 2
+-- avoidExit: how close counts as out, and how long the exit walk may take before giving up.
+local OVERRIDE_TOLERANCE = 2
+local OVERRIDE_TIMEOUT = 20
 
 local function u(rng: Rng, lo: number, hi: number): number
 	return rng:range(lo, hi)
@@ -172,8 +195,71 @@ function Brain.new(rng: Rng, persona: any, now: number, favoritePoiKind: string?
 		excluded = {},
 		wakeBurst = false,
 		lastTripEndedAt = -math.huge,
+		firstTripChosen = false,
+		attentionOff = false,
+		deferredReselectAt = math.huge,
+		override = nil,
+		queuedActions = {},
 	}, Brain)
 	return self
+end
+
+-- Whether the last step left attention off (Afk with afkStyle "full"): the runtime passes it to
+-- the senses as attentionOff so a follower or a stare goes unnoticed while the owner is away.
+function Brain.isAttentionOff(self: BrainT): boolean
+	return self.attentionOff
+end
+
+-- Multiplies the queued delay of an event just pushed, keeping the queue sorted by due time.
+local function stretchDelay(queue: Reaction.Queue, ev: Event, now: number, factor: number)
+	local pending = queue.pending
+	for i, entry in pending do
+		if entry.event == ev then
+			local stretched: Reaction.Pending = { at = now + (entry.at - now) * factor, event = ev }
+			table.remove(pending, i)
+			local index = #pending + 1
+			while index > 1 and pending[index - 1].at > stretched.at do
+				index -= 1
+			end
+			table.insert(pending, index, stretched)
+			return
+		end
+	end
+end
+
+-- A heard line that names the NPC: the senses mark it (data.named) with Reply's rule.
+local function namesMe(ev: Event): boolean
+	if ev.kind ~= "chatHeard" and ev.kind ~= "chatAddressed" then
+		return false
+	end
+	local data = ev.data
+	return type(data) == "table" and data.named == true
+end
+
+-- Whether this NPC may give real directions (help.right lines, DR-47): a veteran (familiarity
+-- above 0.5) standing at a place whose kind it has visited this session.
+local function knowsPoi(self: BrainT, input: Input): boolean
+	local familiarity = self.persona.familiarity
+	if type(familiarity) ~= "number" or familiarity <= 0.5 then
+		return false
+	end
+	local standing: Goals.Poi? = nil
+	for _, poi in input.world.pois do
+		if NavMath.flatDistance(poi.position, input.me.position) <= (poi.radius or 6) then
+			standing = poi
+			break
+		end
+	end
+	if not standing then
+		return false
+	end
+	local kind = (standing :: Goals.Poi).kind
+	for _, poi in input.world.pois do
+		if poi.kind == kind and Memory.lastVisit(self.memory, poi.id) ~= nil then
+			return true
+		end
+	end
+	return false
 end
 
 local function companionship(self: BrainT, input: Input): number
@@ -279,6 +365,9 @@ local function makeActivityContext(
 		groupOf = input.groupOf,
 		inGroup = input.groupOf(input.me.id) ~= nil,
 		wakeBurst = self.wakeBurst,
+		seats = input.world.seats,
+		familiarity = self.persona.familiarity,
+		afkStyle = self.persona.afkStyle,
 	}
 end
 
@@ -322,6 +411,10 @@ local function goalsContext(self: BrainT, input: Input): Goals.Context
 				return failedRecently(target)
 			end,
 			props = world.props,
+			seats = world.seats,
+			seatsNear = world.seatsNear,
+			occupySeat = world.occupySeat,
+			releaseSeat = world.releaseSeat,
 			mood = self.mood.name,
 		} :: any,
 		relations = relations,
@@ -331,6 +424,7 @@ local function goalsContext(self: BrainT, input: Input): Goals.Context
 		attachment = guard.attachment,
 		favoritePoiKind = self.favoritePoiKind,
 		fatigue = self.needs.fatigue,
+		familiarity = self.persona.familiarity,
 	}
 end
 
@@ -424,27 +518,42 @@ local function tickRitual(
 	end
 end
 
--- The first trip: nearest group or place within 60 studs gets a big bonus.
-local function firstTripBonus(self: BrainT, candidates: { Candidate }, input: Input)
-	local best: Candidate? = nil
+-- The first trip after the ritual (DR-37: nobody beelines far in their first seconds). Until a
+-- trip-shaped activity has been chosen, the choice is limited to the nearest group (bonus
+-- proportional to its size), the nearest place within 60 studs (bonus 3), a wander (drawn within
+-- 40 studs) and standing still; interrupt reactions and leaving stay. Everything else is
+-- available from the next selection on.
+local function restrictFirstSelection(candidates: { Candidate }): { Candidate }
+	local nearestGroup: Candidate? = nil
+	local nearestPoi: Candidate? = nil
 	for _, c in candidates do
-		if (c.activity == "JoinGroup" or c.activity == "VisitPoi") and c.distance <= 60 then
-			if not best or c.distance < (best :: Candidate).distance then
-				best = c
+		if c.activity == "JoinGroup" then
+			if nearestGroup == nil or c.distance < (nearestGroup :: Candidate).distance then
+				nearestGroup = c
+			end
+		elseif c.activity == "VisitPoi" and c.distance <= FIRST_TRIP_POI_RANGE then
+			if nearestPoi == nil or c.distance < (nearestPoi :: Candidate).distance then
+				nearestPoi = c
 			end
 		end
 	end
-	if not best then
-		for _, c in candidates do
-			if c.activity == "Wander" then
-				best = c
-				break
-			end
+	if nearestGroup then
+		local g = nearestGroup :: Candidate
+		local group = if g.data then g.data.group else nil
+		local members = if group and group.members then #group.members else 2
+		g.bonus = (g.bonus or 0) + FIRST_TRIP_GROUP_BONUS_PER_MEMBER * members
+	end
+	if nearestPoi then
+		local p = nearestPoi :: Candidate
+		p.bonus = (p.bonus or 0) + FIRST_TRIP_POI_BONUS
+	end
+	local kept: { Candidate } = {}
+	for _, c in candidates do
+		if FIRST_SELECTION_ALWAYS[c.activity] or c == nearestGroup or c == nearestPoi then
+			table.insert(kept, c)
 		end
 	end
-	if best then
-		(best :: Candidate).bonus = ((best :: Candidate).bonus or 0) + 3
-	end
+	return kept
 end
 
 -- Random abandonment of the running trip: p = dt * (0.002 + 0.006 * impulsivity) per step, never
@@ -507,17 +616,37 @@ function Brain.step(self: BrainT, input: Input): Output
 	if phaseChanged and self.session.phase == "leaving" then
 		self.forceReselect = true
 	end
+	-- A flung body waits out its hold before the mind chooses again (§2.15).
+	if now >= self.deferredReselectAt then
+		self.deferredReselectAt = math.huge
+		self.forceReselect = true
+	end
+	-- Actions raised by system events between steps (a word after a fall).
+	for _, a in self.queuedActions do
+		table.insert(actions, a)
+	end
+	table.clear(self.queuedActions)
 
 	-- 2. Events: absorb, queue with reaction delay, then weigh the due ones. Far and dormant
-	-- NPCs are not sensed at, so nothing sensed gets in and only system events come due.
+	-- NPCs are not sensed at, so nothing sensed gets in and only system events come due. With
+	-- attention off (a full AFK) only system events and lines naming the NPC get in; a semi-AFK
+	-- notices everything, three times later.
 	local salient = false
 	if not quiet then
+		local semiAfk = self.activity ~= nil
+			and (self.activity :: Activities.Activity).name == "Afk"
+			and persona.afkStyle == "semi"
 		for _, ev in input.events do
+			if self.attentionOff and not SYSTEM_EVENT_KINDS[ev.kind] and not namesMe(ev) then
+				continue
+			end
 			absorb(self, ev, now)
 			if ev.salience >= 0.6 then
 				salient = true
 			end
-			Reaction.push(self.reactions, ev, now, persona, self.mood.name, rng)
+			if Reaction.push(self.reactions, ev, now, persona, self.mood.name, rng) and semiAfk then
+				stretchDelay(self.reactions, ev, now, SEMI_AFK_DELAY_SCALE)
+			end
 		end
 	end
 	Mood.update(self.mood, now, self.needs, moodContext(self, input, now), persona, rng, salient)
@@ -539,12 +668,45 @@ function Brain.step(self: BrainT, input: Input): Output
 			pending = ev
 		end
 	end
+	-- A game event that got through: sometimes a cheer and a word, on top of its candidates.
+	if pending and (pending :: Event).kind == "gameEvent" then
+		if rng:chance(0.3) then
+			table.insert(actions, { kind = "emote", name = "cheer", cutAfter = rng:logNormalClamped(3, 0.5, 1.5, 6) })
+		end
+		if rng:chance(0.2 * persona.chattiness) then
+			table.insert(actions, { kind = "forceLine", category = "reaction" })
+		end
+	end
 
 	local ctx = makeActivityContext(self, input, intents, actions, suppress)
 
-	-- 3. Ritual or (re)selection.
+	-- An exit walk out of a no-go volume that is over (or took too long) frees the choice again.
+	local override = self.override
+	if override then
+		local o = override :: { position: Vector3, until_: number }
+		if NavMath.flatDistance(input.me.position, o.position) <= OVERRIDE_TOLERANCE or now >= o.until_ then
+			self.override = nil
+			override = nil
+			self.forceReselect = true
+		end
+	end
+
+	-- 3. Ritual, exit walk, or (re)selection.
 	if not self.ritual.done then
 		tickRitual(self, input, intents, actions, suppress)
+	elseif override then
+		-- Pushed inside a no-go area: the runtime's exit point replaces whatever was wanted.
+		local o = override :: { position: Vector3, until_: number }
+		if self.activity and self.activityStatus ~= "running" then
+			stopActivity(self, ctx, self.activityStatus, now)
+		end
+		table.insert(intents, {
+			kind = "goto",
+			position = o.position,
+			urgency = 0.9,
+			tolerance = OVERRIDE_TOLERANCE,
+			stopDistance = 0.5,
+		})
 	else
 		-- Random abandonment of trips (may start an about-face that defers the next choice).
 		if now >= self.aboutFaceUntil and maybeAbandon(self, input, ctx) then
@@ -567,6 +729,9 @@ function Brain.step(self: BrainT, input: Input): Output
 						end
 					end
 				end
+				if not self.firstTripChosen then
+					candidates = restrictFirstSelection(candidates)
+				end
 				-- A finished trip is usually followed by a short pause before the next thing.
 				if status == "success" and self.lastTripEndedAt == now then
 					for _, c in candidates do
@@ -574,14 +739,6 @@ function Brain.step(self: BrainT, input: Input): Output
 							c.bonus = (c.bonus or 0) + 1.5
 						end
 					end
-				end
-				if
-					self.session.phase == "orienting"
-					and self.activity == nil
-					and Memory.lastActivityEnd(self.memory, "IdleStand") == nil
-					and #self.memory.activities == 0
-				then
-					firstTripBonus(self, candidates, input)
 				end
 				local scored = Utility.score(utilityContext(self, now), candidates)
 				local current: Scored? = nil
@@ -594,13 +751,22 @@ function Brain.step(self: BrainT, input: Input): Output
 				if chosen and chosen ~= current then
 					local previous = self.activity
 					if previous then
-						-- Swapping out a trip that was still under way is a change of mind.
+						-- Swapping out a trip that was still under way is a change of mind. A failure
+						-- the runtime reported (goalInvalid, stuck) stays a failure even when its
+						-- own system reaction is what interrupts, so the target is excluded.
 						if previous.hasTrip and status == "running" then
 							changedMind = true
 						end
-						stopActivity(self, ctx, if pending then "interrupted" else status, now)
+						local outcome = status
+						if status ~= "failed" and pending then
+							outcome = "interrupted"
+						end
+						stopActivity(self, ctx, outcome, now)
 					end
 					startActivity(self, ctx, chosen, now)
+					if self.activity and (self.activity :: Activities.Activity).hasTrip then
+						self.firstTripChosen = true
+					end
 				elseif chosen == nil and self.activity == nil then
 					-- Nothing scored (should not happen: IdleStand always exists).
 					startActivity(self, ctx, { candidate = { activity = "IdleStand", distance = 0 }, score = 1 }, now)
@@ -620,6 +786,7 @@ function Brain.step(self: BrainT, input: Input): Output
 			end
 		end
 	end
+	self.attentionOff = suppress.attention == true
 
 	-- 5. Overlays. Far and dormant NPCs skip them: nobody is close enough to read a line or
 	-- see a fidget, so the talk and emote actions activities asked for are dropped too.
@@ -672,6 +839,11 @@ function Brain.step(self: BrainT, input: Input): Output
 			wakeBurst = self.wakeBurst,
 			fellNearby = input.fellNearby,
 			poiWord = input.poiWord,
+			reading = input.reading,
+			nearest = input.nearest,
+			platformFreezes = input.platformFreezes,
+			knowsPoi = knowsPoi(self, input),
+			interrupted = pending ~= nil,
 		}
 		-- Forced lines requested by activities go through the overlay's composer.
 		for i = #actions, 1, -1 do
@@ -733,25 +905,72 @@ function Brain.step(self: BrainT, input: Input): Output
 		phase = self.session.phase,
 		mood = self.mood.name,
 		changedMind = changedMind,
+		attentionOff = self.attentionOff,
 	}
 end
 
--- The runtime tells the brain something happened to the body or the session: a trip failed for
--- good (recovery exhausted), the body fell or was flung, a goal turned out invalid, someone with
--- this name joined ("nameCollision": the session now ends within LNc(20, 0.4, 5, 45) s), the
--- server is closing ("serverClosing": leave now), or a game event fired (`data`). Kinds without
--- a special rule become a system reaction, fail the running activity and force a new choice.
+-- The runtime tells the brain something happened to the body or the session. Each kind has its
+-- rule: "nameCollision" (someone with this name joined) ends the session within
+-- LNc(20, 0.4, 5, 45) s; "serverClosing" leaves now; "flung" (`data.hold` = the locomotion hold
+-- in seconds) chooses again once the hold is over; "fell" says something with p 0.3 chattiness
+-- and chooses again; "avoidExit" (`position` = the exit point the runtime picked) walks there at
+-- urgency 0.9 before anything else; "gameEvent" (`data = { name, magnitude }`, `position`)
+-- becomes a reaction of salience clamp(magnitude, 0.3, 1) that goes through the usual delay and
+-- miss, and pulls toward the nearest objective when it lands; "goalInvalid" fails the activity
+-- and drops its target from memory. Any other kind ("stuck", "kicked", "pathFailed", ...)
+-- becomes an immediate system reaction, fails the running activity and forces a new choice.
 function Brain.onSystemEvent(self: BrainT, kind: string, now: number, position: Vector3?, data: any?)
+	local rng = self.rng
 	if kind == "nameCollision" then
-		local leaveAt = now + self.rng:logNormalClamped(20, 0.4, 5, 45)
-		self.session.leaveAt = math.min(self.session.leaveAt, leaveAt)
+		local before = self.session.leaveAt
+		Session.shorten(self.session, now, rng, 20, 0.4, 5, 45)
+		self.session.leaveAt = math.min(before, self.session.leaveAt)
 		return
 	elseif kind == "serverClosing" then
 		self:leaveNow()
 		return
+	elseif kind == "flung" then
+		local hold = if type(data) == "table" and type(data.hold) == "number" then data.hold else FLUNG_HOLD_DEFAULT
+		self.deferredReselectAt = now + hold
+		return
+	elseif kind == "fell" then
+		if rng:chance(0.3 * self.persona.chattiness) then
+			table.insert(self.queuedActions, { kind = "forceLine", category = "reaction" })
+		end
+		self.forceReselect = true
+		if self.activity then
+			self.activityStatus = "interrupted"
+		end
+		return
+	elseif kind == "avoidExit" then
+		if position then
+			self.override = { position = position, until_ = now + OVERRIDE_TIMEOUT }
+			if self.activity then
+				self.activityStatus = "interrupted"
+			end
+		end
+		return
+	elseif kind == "gameEvent" then
+		local d: any = if type(data) == "table" then data else {}
+		local magnitude = if type(d.magnitude) == "number" then d.magnitude else 0.5
+		Reaction.push(self.reactions, {
+			kind = "gameEvent",
+			salience = math.clamp(magnitude, 0.3, 1),
+			expected = false,
+			at = now,
+			data = { name = d.name, position = position or d.position, magnitude = magnitude },
+		}, now, self.persona, self.mood.name, rng)
+		return
 	end
 	if kind == "stuck" and position then
 		Memory.recordStuck(self.memory, position, now)
+	end
+	if kind == "goalInvalid" and self.currentScored then
+		-- The place is gone or unreachable: forget the visit, and stopActivity excludes it.
+		local target = self.currentScored.candidate.target
+		if target then
+			self.memory.visited[target] = nil
+		end
 	end
 	Reaction.push(
 		self.reactions,

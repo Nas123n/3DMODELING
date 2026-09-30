@@ -11,6 +11,7 @@
 -- estimated at 20 us per node when absent) stays under the budget. A request cancelled mid-search
 -- is dropped and its coroutine abandoned; one that waits longer than `queueTimeout` completes with
 -- `Timeout`. Not a scheduler: whoever calls `step` decides when and how much budget to give.
+-- requires: NavGrid, NavMath, Types
 
 local NavGrid = require(script.Parent.NavGrid)
 local NavMath = require(script.Parent.NavMath)

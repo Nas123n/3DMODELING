@@ -2,6 +2,7 @@
 -- Remembers which corpus lines were said recently, so the same line is not heard twice across
 -- the server within a quarter of an hour, and an NPC never repeats itself within the hour.
 -- Template feel ("that guy said exactly that a minute ago") is one of the loudest chat tells.
+-- requires: (none)
 
 local Recency = {}
 Recency.__index = Recency

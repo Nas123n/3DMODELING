@@ -4,6 +4,7 @@
 -- Beyond the uniform basics it offers the shapes human timing actually has: normal (jitter),
 -- log-normal (reaction times, dwell times: right-skewed with a long tail) and exponential
 -- (waiting times between bursts).
+-- requires: (none)
 
 local Rng = {}
 Rng.__index = Rng

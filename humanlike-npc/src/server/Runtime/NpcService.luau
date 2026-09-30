@@ -4,6 +4,7 @@
 -- chat, and hands each NPC a perception of the world. The world itself (bodies, players, the
 -- presenter, the navigation grid, the points of interest) comes in through an adapter, so the
 -- same service runs under Lune with fake bodies and in Studio with humanoids.
+-- requires: GoalResolver, GridPathProvider, Memory, Names, NavGrid, NavMath, Npc, PathPlanner, Personality, PoiRegistry, Recency, Rng, Safety, Scheduler, Spatial
 
 local Rng = require(script.Parent.Parent.Rng)
 local NavMath = require(script.Parent.Parent.Nav.NavMath)

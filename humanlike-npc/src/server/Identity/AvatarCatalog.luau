@@ -13,6 +13,7 @@
 -- NPC is rebuilt with ids 0 (§3.6). `withPlaceholderIds` numbers the entries with plainly fake
 -- ids (1000001, 1000002, ...) so tests and dry runs can tell entries apart; those ids are not
 -- real assets and must never reach a HumanoidDescription.
+-- requires: (none)
 
 local AvatarCatalog = {}
 

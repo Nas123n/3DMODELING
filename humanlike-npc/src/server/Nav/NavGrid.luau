@@ -20,6 +20,7 @@
 -- yieldable under both runtimes, yet nothing would ever resume it.
 --
 -- Everything here is plain Luau over Vector3, so it runs identically in Studio and under Lune.
+-- requires: (none)
 
 local NavGrid = {}
 NavGrid.__index = NavGrid

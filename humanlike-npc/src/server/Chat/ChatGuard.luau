@@ -7,6 +7,7 @@
 -- It replaces the inline chatAllowed in NpcService. It is not a content filter (Safety) and
 -- not a reply decision (Reply); it never reads a clock, `now` is injected, so the same sequence
 -- of calls always gives the same answers.
+-- requires: (none)
 
 local ChatGuard = {}
 ChatGuard.__index = ChatGuard

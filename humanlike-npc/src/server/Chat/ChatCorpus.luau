@@ -21,6 +21,7 @@
 --
 -- "game" is empty here on purpose: the game adds its own lines with ChatCorpus.extend and the
 -- composer skips the category while it is empty.
+-- requires: (none)
 
 local ChatCorpus = {}
 

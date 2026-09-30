@@ -42,7 +42,7 @@ export type Persona = {
 export type Tier = string
 
 -- Answers whether a point is standable ("walkable"), a wall to graze ("wall") or nothing ("void").
-export type WalkableCheck = (point: Vector3) -> "walkable" | "wall" | "void"
+export type WalkableCheck = (point: Vector3) -> string
 
 export type Options = {
 	walkableCheck: WalkableCheck?,

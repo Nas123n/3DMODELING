@@ -18,7 +18,8 @@ JumpHabit.__index = JumpHabit
 -- "never" | "occasional" | "spammer"
 export type Tier = string
 
-export type Mood = "bored" | "engaged" | "social" | "afk" | "neutral"
+-- "bored" | "engaged" | "social" | "afk" | "neutral" | any other mood name (treated as neutral)
+export type Mood = string
 
 export type Habit = typeof(setmetatable(
 	{} :: {

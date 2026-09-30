@@ -15,6 +15,7 @@ local suites = {
 	require("./ChatCorpus.spec"),
 	require("./ChatStyle.spec"),
 	require("./WaypointFollower.spec"),
+	require("./NavRuntime.spec"),
 }
 
 for _, suite in suites do

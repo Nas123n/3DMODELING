@@ -14,7 +14,8 @@ type Rng = Rng.Rng
 
 local ChatStyle = {}
 
-export type InputProfile = "pc" | "pcShiftLock" | "mobile" | "console"
+-- "pc" | "pcShiftLock" | "mobile" | "console"
+export type InputProfile = string
 
 export type Voice = {
 	profile: InputProfile,

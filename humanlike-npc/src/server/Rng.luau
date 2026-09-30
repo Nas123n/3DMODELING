@@ -141,6 +141,13 @@ function Rng.logNormalClamped(self: Rng, median: number, spread: number, lo: num
 	return math.clamp(self:logNormal(median, spread), lo, hi)
 end
 
+-- Kumaraswamy(a, b) on [0, 1]: a cheap Beta look-alike with a closed-form inverse CDF. a < 1
+-- piles mass near 0, b < 1 near 1, both > 1 make a hump. Used for personality traits.
+function Rng.kumaraswamy(self: Rng, a: number, b: number): number
+	local u = self:next()
+	return (1 - (1 - u) ^ (1 / b)) ^ (1 / a)
+end
+
 -- Independent child generator, so adding a consumer doesn't reshuffle every other one.
 function Rng.fork(self: Rng, salt: string): Rng
 	return Rng.new(bit32.bxor(self:nextUInt(), hashString(salt)))

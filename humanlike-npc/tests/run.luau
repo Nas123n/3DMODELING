@@ -19,6 +19,7 @@ local suites = {
 	require("./Human.spec"),
 	require("./Humanizer.spec"),
 	require("./Planner.spec"),
+	require("./Mind.spec"),
 }
 
 for _, suite in suites do

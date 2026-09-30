@@ -111,6 +111,21 @@ return function(T, Loader)
 			T.equal(rng:logNormalClamped(1, 0.5, 0.5, 2) >= 0.5, true)
 		end)
 
+		T.it("kumaraswamy stays in [0, 1] and skews as its parameters say", function()
+			local rng = Rng.new(17)
+			local low, high, n = 0, 0, 5000
+			for _ = 1, n do
+				local a = rng:kumaraswamy(1, 6)
+				local b = rng:kumaraswamy(6, 1)
+				T.between(a, 0, 1)
+				T.between(b, 0, 1)
+				low += a
+				high += b
+			end
+			T.check(low / n < 0.2, "(1, 6) piles near zero")
+			T.check(high / n > 0.8, "(6, 1) piles near one")
+		end)
+
 		T.it("shuffle keeps every element exactly once", function()
 			local rng = Rng.new(21)
 			local list = { 1, 2, 3, 4, 5, 6, 7, 8 }

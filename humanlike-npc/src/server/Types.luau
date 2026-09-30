@@ -86,6 +86,7 @@ export type PoiRecord = {
 export type SpawnRecord = { id: string, cframe: CFrame, size: Vector3 } -- top-surface rectangle
 export type AvoidRecord = { id: string, cframe: CFrame, size: Vector3 }
 
-export type InputProfileKind = "pc" | "pcShiftLock" | "mobile" | "console"
+-- "pc" | "pcShiftLock" | "mobile" | "console"
+export type InputProfileKind = string
 
 return {}

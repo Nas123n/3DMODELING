@@ -66,7 +66,7 @@ function Rng.sign(self: Rng): number
 	return if self:next() < 0.5 then -1 else 1
 end
 
-function Rng.pick<T>(self: Rng, list: { T }): T
+function Rng.pick(self: Rng, list: { any }): any
 	assert(#list > 0, "Rng:pick called with an empty list")
 	return list[self:int(1, #list)]
 end
@@ -99,7 +99,7 @@ function Rng.weightedIndex(self: Rng, weights: { number }): number
 end
 
 -- In-place Fisher-Yates shuffle.
-function Rng.shuffle<T>(self: Rng, list: { T })
+function Rng.shuffle(self: Rng, list: { any })
 	for i = #list, 2, -1 do
 		local j = self:int(1, i)
 		list[i], list[j] = list[j], list[i]

@@ -129,6 +129,18 @@ function Rng.exponential(self: Rng, mean: number): number
 	return -mean * math.log(1 - self:next())
 end
 
+-- Ex-Gaussian: a normal (mu, sigma) plus an exponential tail with mean tau. This is the shape of
+-- human reaction times: a bump around mu with a long right tail. Never below `floor` (default 0).
+function Rng.exGaussian(self: Rng, mu: number, sigma: number, tau: number, floor: number?): number
+	local value = self:gaussian(mu, sigma) + self:exponential(tau)
+	return math.max(floor or 0, value)
+end
+
+-- Log-normal clipped to [lo, hi]; the workhorse for dwell times and pauses.
+function Rng.logNormalClamped(self: Rng, median: number, spread: number, lo: number, hi: number): number
+	return math.clamp(self:logNormal(median, spread), lo, hi)
+end
+
 -- Independent child generator, so adding a consumer doesn't reshuffle every other one.
 function Rng.fork(self: Rng, salt: string): Rng
 	return Rng.new(bit32.bxor(self:nextUInt(), hashString(salt)))

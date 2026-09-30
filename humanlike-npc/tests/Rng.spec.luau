@@ -91,6 +91,26 @@ return function(T, Loader)
 			T.near(sum / n, 2, 0.06, "mean")
 		end)
 
+		T.it("exGaussian sits above mu on average with a right tail, never below the floor", function()
+			local rng = Rng.new(13)
+			local n, sum, below, big = 20000, 0, 0, 0
+			for _ = 1, n do
+				local x = rng:exGaussian(0.6, 0.15, 0.8, 0.1)
+				T.check(x >= 0.1, "floor")
+				sum += x
+				if x < 0.6 then
+					below += 1
+				end
+				if x > 3 then
+					big += 1
+				end
+			end
+			T.near(sum / n, 1.4, 0.05, "mean is mu + tau")
+			T.check(below / n < 0.35, "most samples sit above mu")
+			T.between(big / n, 0.02, 0.08, "a few percent land in the long tail")
+			T.equal(rng:logNormalClamped(1, 0.5, 0.5, 2) >= 0.5, true)
+		end)
+
 		T.it("shuffle keeps every element exactly once", function()
 			local rng = Rng.new(21)
 			local list = { 1, 2, 3, 4, 5, 6, 7, 8 }

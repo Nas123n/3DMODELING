@@ -12,6 +12,7 @@ local suites = {
 	require("./NavGrid.spec"),
 	require("./Names.spec"),
 	require("./ChatCorpus.spec"),
+	require("./ChatStyle.spec"),
 }
 
 for _, suite in suites do

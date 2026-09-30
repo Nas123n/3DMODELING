@@ -1,0 +1,26 @@
+{
+  "name": "humanlike-npc",
+  "tree": {
+    "$className": "DataModel",
+    "ServerStorage": {
+      "HumanlikeNpc": {
+        "$path": "src/server"
+      }
+    },
+    "ServerScriptService": {
+      "HumanlikeNpcBootstrap": {
+        "$path": "src/server/Bootstrap.server.luau"
+      }
+    },
+    "ReplicatedStorage": {
+      "HumanlikeNpcShared": {
+        "$path": "src/shared"
+      }
+    },
+    "StarterPlayer": {
+      "StarterPlayerScripts": {
+        "$path": "src/client"
+      }
+    }
+  }
+}

@@ -132,7 +132,7 @@ local function addStep(
 		trace.firstYaw = firstYaw
 	end
 	-- dirFromYaw(pi) is +Z, so the first step's heading maps onto +Z and every later dir keeps its offset.
-	local relative = if dir.Magnitude < 1e-6 then Vector3.zero else rotateY(dir, math.pi - firstYaw)
+	local relative = if dir.Magnitude < 1e-6 then Vector3.zero else rotateY(dir, math.pi - (firstYaw :: number))
 	table.insert(trace.steps, { dir = relative, magnitude = magnitude, jump = jump, dt = dt })
 	trace.seconds += dt
 end
@@ -173,7 +173,7 @@ function TraceBank.observe(self: Bank, sample: Sample, playerKey: number, rng: R
 			since = at
 			trace.stillSince = since
 		end
-		if at - since >= TraceBank.STOP_SECONDS then
+		if at - (since :: number) >= TraceBank.STOP_SECONDS then
 			closeFragment(self, trace, rng)
 			trace.stillSteps = {}
 			return

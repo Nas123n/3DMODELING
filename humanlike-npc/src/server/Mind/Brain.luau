@@ -84,6 +84,7 @@ export type BrainT = typeof(setmetatable(
 		aboutFaceDir: Vector3?,
 		excluded: { [string]: number }, -- target -> until
 		wakeBurst: boolean,
+		lastTripEndedAt: number,
 	},
 	Brain
 ))
@@ -120,6 +121,7 @@ function Brain.new(rng: Rng, persona: any, now: number, favoritePoiKind: string?
 		aboutFaceDir = nil,
 		excluded = {},
 		wakeBurst = false,
+		lastTripEndedAt = -math.huge,
 	}, Brain)
 	return self
 end
@@ -304,6 +306,9 @@ local function stopActivity(self: BrainT, ctx: Activities.Context, outcome: stri
 	activity.stop(ctx, self.state, outcome)
 	local target = if self.currentScored then self.currentScored.candidate.target else nil
 	Memory.recordActivity(self.memory, activity.name, target, self.startedAt, now, outcome)
+	if activity.hasTrip and outcome == "success" then
+		self.lastTripEndedAt = now
+	end
 	if outcome == "failed" and target then
 		self.excluded[target] = now + 300
 	end
@@ -467,6 +472,14 @@ function Brain.step(self: BrainT, input: Input): Output
 			end
 			if pending or status ~= "running" or self.forceReselect or now >= self.nextReviewAt then
 				local candidates = Goals.candidates(goalsContext(self, input), pending)
+				-- A finished trip is usually followed by a short pause before the next thing.
+				if status == "success" and self.lastTripEndedAt == now then
+					for _, c in candidates do
+						if c.activity == "IdleStand" then
+							c.bonus = (c.bonus or 0) + 1.5
+						end
+					end
+				end
 				if
 					self.session.phase == "orienting"
 					and self.activity == nil

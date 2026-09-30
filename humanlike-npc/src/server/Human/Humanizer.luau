@@ -359,16 +359,22 @@ end
 -- Starts a planned event.
 local function activate(self: HumanizerT, plan: Planned, now: number, body: BodyState)
 	local active: Active = { kind = plan.kind, phase = 1, phaseEndsAt = now + plan.duration, plan = plan }
+	-- Every scripted event is a deliberate lack of progress: the stuck detector must not count it.
+	self.suppressedUntil = math.min(now + plan.duration + 0.5, now + 3)
 	if plan.kind == "aboutFace" then
 		active.phaseEndsAt = now + u(self.tripRng, 0.1, 0.3)
 		local follower = self.follower :: Follower
 		active.points = follower:rewind(plan.rewindStuds or 4, body.position)
 		active.pointIndex = 2
+		self.suppressedUntil = now + 3
 	elseif plan.kind == "wallBump" then
 		active.phaseEndsAt = now + (plan.extra or 1)
 		self.suppressedUntil = math.min(now + (plan.extra or 1) + 0.6, now + 3)
 	elseif plan.kind == "correction" then
 		active.phaseEndsAt = now + plan.duration
+		self.suppressedUntil = now + plan.duration + 1
+	elseif plan.kind == "distraction" then
+		self.suppressedUntil = now + plan.duration + 0.5
 	end
 	self.active = active
 end
@@ -422,6 +428,7 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 			end
 			return stop(), false
 		elseif active.phase == 2 then
+			self.suppressedUntil = math.max(self.suppressedUntil, now + 1)
 			local points = active.points :: { Vector3 }
 			local index = active.pointIndex :: number
 			while index <= #points and NavMath.flatDistance(input.body.position, points[index]) < 1 do
@@ -538,6 +545,11 @@ function Humanizer.apply(self: HumanizerT, input: Input): Output
 
 	local cmd = table.clone(input.command)
 	if cmd.mode ~= "move" or self.tier == "far" or self.tier == "dormant" then
+		return { command = cmd, events = events, abandonTrip = false }
+	end
+	if midJump then
+		-- Committing to a jump: full deflection, no wobble, until landing.
+		cmd.magnitude = 1
 		return { command = cmd, events = events, abandonTrip = false }
 	end
 	if cmd.dir.Magnitude < 1e-6 then

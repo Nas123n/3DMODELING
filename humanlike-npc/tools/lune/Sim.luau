@@ -81,6 +81,11 @@ function Sim.step(self, command, dt: number)
 	end
 
 	local horizontal = dir * (self.walkSpeed * magnitude)
+	if not self.onGround then
+		-- Momentum carries through the air; input only nudges it (Roblox's limited air control).
+		local carried = Vector3.new(self.velocity.X, 0, self.velocity.Z)
+		horizontal = carried:Lerp(horizontal, 0.15)
+	end
 	local nextX = self.position.X + horizontal.X * dt
 	local nextZ = self.position.Z + horizontal.Z * dt
 	local moved = true

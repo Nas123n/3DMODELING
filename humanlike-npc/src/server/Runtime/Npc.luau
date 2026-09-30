@@ -70,6 +70,9 @@ export type Deps = {
 
 export type Report = {
 	command: MoveCommand,
+	position: Vector3,
+	remaining: number,
+	humanizerBusy: boolean,
 	intent: string,
 	activity: string?,
 	target: string?,
@@ -83,6 +86,7 @@ export type Report = {
 export type NpcT = typeof(setmetatable(
 	{} :: {
 		id: string,
+		entityId: string, -- "n:<id>", how the spatial index knows this NPC
 		identity: Identity,
 		persona: any,
 		rng: Rng,
@@ -123,6 +127,8 @@ export type NpcT = typeof(setmetatable(
 		velocityJump: number?,
 		lastSteerBlockedBy: string?,
 		lastThinkAt: number?,
+		jumpFailures: number,
+		lastRemaining: number?,
 	},
 	Npc
 ))
@@ -137,6 +143,7 @@ function Npc.new(identity: Identity, persona: any, seed: Rng, deps: Deps, now: n
 	local rng = seed:fork("npc:" .. identity.id)
 	local self = setmetatable({
 		id = identity.id,
+		entityId = "n:" .. identity.id,
 		identity = identity,
 		persona = persona,
 		rng = rng,
@@ -186,6 +193,8 @@ function Npc.new(identity: Identity, persona: any, seed: Rng, deps: Deps, now: n
 		velocityJump = nil,
 		lastSteerBlockedBy = nil,
 		lastThinkAt = nil,
+		jumpFailures = 0,
+		lastRemaining = nil,
 	}, Npc)
 	return self
 end
@@ -312,8 +321,9 @@ local function applyIntent(self: NpcT, intent: Intent, body: BodyState, now: num
 		if self.freezeVariant == "walkStraight" then
 			local last = self.lastCommand
 			self.freezeDir = if last and last.mode == "move" then last.dir else nil
-			self.stuck:suppress(now, self.freezeUntil)
 		end
+		-- Typing is a deliberate stop (or a deliberate straight walk): never a stuck verdict.
+		self.stuck:suppress(now, self.freezeUntil)
 	end
 	if (intent :: any).jump then
 		self.jumpRequested = true
@@ -327,7 +337,13 @@ local function think(self: NpcT, body: BodyState, now: number, dt: number, movin
 	local heading = NavMath.dirFromYaw(body.yaw)
 	local visible: { [string]: boolean } = {}
 	local events = self.senses:step({
-		me = { id = self.id, position = body.position, heading = heading, moving = moving, velocity = body.velocity },
+		me = {
+			id = self.entityId,
+			position = body.position,
+			heading = heading,
+			moving = moving,
+			velocity = body.velocity,
+		},
 		entities = snap.entities,
 		chats = snap.chats,
 		groups = perception:groups(),
@@ -443,6 +459,7 @@ function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 		followerEvents = out.events
 		command = out.command
 		remaining = out.remaining
+		self.lastRemaining = remaining
 		for _, e in out.events do
 			if e.kind == "finished" then
 				self.locomotionStatus = "arrived"
@@ -451,13 +468,21 @@ function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 			elseif e.kind == "waypoint" then
 				self.recovery:onProgress(now, 4)
 			elseif e.kind == "jumpFailed" then
-				table.insert(eventsOut, "jumpFailed")
-				-- Retry once through recovery: back up and jump again, else re-path.
-				local level = self.recovery:onStuck(now, body, forward, "stuck")
-				follower:resume()
-				if level >= 2 then
-					requestPath(self, body, self.goal :: Vector3, now, 0)
+				table.insert(eventsOut, "jumpFailed:" .. (e.label or "?"))
+				-- First failure: simply try the jump again. Second in a row: let recovery handle it
+				-- (back up and jump, then re-path with the jump penalized).
+				self.jumpFailures += 1
+				if self.jumpFailures <= 1 then
+					follower:resume()
+				else
+					local level = self.recovery:onStuck(now, body, forward, "stuck")
+					follower:resume()
+					if level >= 2 then
+						requestPath(self, body, self.goal :: Vector3, now, 0)
+					end
 				end
+			elseif e.kind == "jumpLanded" then
+				self.jumpFailures = 0
 			elseif e.kind == "custom" then
 				follower:resume()
 			end
@@ -470,7 +495,11 @@ function Npc.tick(self: NpcT, now: number, runBrain: boolean): Report
 
 	-- Stuck detection and recovery on trips.
 	local verdict: string = "ok"
-	if self.locomotionStatus == "walking" and now >= self.humanizer:suppressUntil() then
+	local humanizerQuietUntil = self.humanizer:suppressUntil()
+	if humanizerQuietUntil > now then
+		self.stuck:suppress(now, humanizerQuietUntil)
+	end
+	if self.locomotionStatus == "walking" then
 		verdict = self.stuck:update(body, intendedSpeed, remaining, now)
 	end
 	if self.recovery:isActive() then
@@ -593,8 +622,12 @@ end
 
 function Npc.report(self: NpcT, command: MoveCommand, intent: string, events: { string }): Report
 	local d = self.brain:describe()
+	local body = self.lastBody
 	return {
 		command = command,
+		position = if body then body.position else Vector3.zero,
+		remaining = self.lastRemaining or 0,
+		humanizerBusy = self.humanizer:isBusy(),
 		intent = intent,
 		activity = d.activity,
 		target = d.target,

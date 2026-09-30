@@ -22,6 +22,7 @@ local suites = {
 	require("./Mind.spec"),
 	require("./MindCore.spec"),
 	require("./Senses.spec"),
+	require("./Integration.spec"),
 }
 
 for _, suite in suites do

@@ -187,13 +187,16 @@ function WaypointFollower.rewind(self: Follower, studs: number, position: Vector
 	return points
 end
 
--- Straight-line studs left from `position` through the remaining waypoints.
-function WaypointFollower.remainingDistance(self: Follower, position: Vector3): number
+-- Straight-line studs left from `position` through the remaining waypoints, measured from the
+-- waypoint currently steered toward (`fromIndex`, default the next one) so cutting a corner
+-- toward a farther waypoint still counts as progress.
+function WaypointFollower.remainingDistance(self: Follower, position: Vector3, fromIndex: number?): number
 	if self.finished or self.nextIndex > #self.waypoints then
 		return 0
 	end
-	local total = NavMath.flatDistance(position, self.waypoints[self.nextIndex].position)
-	for i = self.nextIndex + 1, #self.waypoints do
+	local start = math.clamp(fromIndex or self.nextIndex, self.nextIndex, #self.waypoints)
+	local total = NavMath.flatDistance(position, self.waypoints[start].position)
+	for i = start + 1, #self.waypoints do
 		total += NavMath.flatDistance(self.waypoints[i - 1].position, self.waypoints[i].position)
 	end
 	return total
@@ -319,6 +322,7 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 	local landing = self.waypoints[self.nextIndex + 1]
 	local command: MoveCommand
 	local target: Vector3? = nil
+	local targetIndex = self.nextIndex
 
 	if w.action == "Jump" and landing then
 		if self.jumpState == "none" then
@@ -363,7 +367,7 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 					self.jumpState = "none"
 					self.paused = true
 					self.failedJump = self.nextIndex
-					table.insert(events, { kind = "jumpFailed", index = self.nextIndex })
+					table.insert(events, { kind = "jumpFailed", index = self.nextIndex, label = "noTakeoff" })
 					command = stopCommand()
 				else
 					self.jumpRequestedAt = now
@@ -381,7 +385,7 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 				self.jumpState = "none"
 				self.paused = true
 				self.failedJump = self.nextIndex
-				table.insert(events, { kind = "jumpFailed", index = self.nextIndex })
+				table.insert(events, { kind = "jumpFailed", index = self.nextIndex, label = "airborneTimeout" })
 			end
 			command = if self.paused then stopCommand() else moveToward(body.position, landing.position, false)
 			target = landing.position
@@ -390,7 +394,7 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 				self.jumpState = "none"
 				self.paused = true
 				self.failedJump = self.nextIndex
-				table.insert(events, { kind = "jumpFailed", index = self.nextIndex })
+				table.insert(events, { kind = "jumpFailed", index = self.nextIndex, label = "short" })
 				command = stopCommand()
 			else
 				self.jumpState = "none"
@@ -409,9 +413,10 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 			end
 		end
 	else
-		local point, _ = lookaheadTarget(self, body.position)
+		local point, index = lookaheadTarget(self, body.position)
 		command = moveToward(body.position, point, false)
 		target = point
+		targetIndex = index
 	end
 
 	-- Timeouts: base 1.5 s plus the leg length at half speed.
@@ -434,7 +439,7 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 		command = command,
 		events = events,
 		target = target,
-		remaining = self:remainingDistance(body.position),
+		remaining = self:remainingDistance(body.position, targetIndex),
 		cornerAngle = cornerAngle,
 	}
 end

@@ -94,8 +94,12 @@ local SATISFIES: { [string]: { boredom: number?, social: number?, purpose: numbe
 	}
 
 function Utility.need(activity: string, needs: NeedsTable): number
+	if activity == "ReactProbe" or activity == "Leave" then
+		return 1 -- reactions and leaving are not need-driven
+	end
 	local row: { [string]: number } = SATISFIES[activity] or {}
-	local total = 0.15
+	-- People stand around regardless of needs; idling never competes from the floor.
+	local total = if activity == "IdleStand" then 0.45 else 0.15
 	for key, weight in row do
 		local value = (needs :: any)[key] or 0
 		total += value * weight

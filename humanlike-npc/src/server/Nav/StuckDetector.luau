@@ -64,6 +64,7 @@ function StuckDetector.reset(self: Detector, now: number)
 	self.lastRemaining = nil
 	self.stuckTime = 0
 	self.pushTime = 0
+	self.lastTickAt = now
 end
 
 -- Ignore lack of progress until `untilTime` (capped at 3 s from now: nothing scripted lasts longer).
@@ -84,7 +85,8 @@ function StuckDetector.update(
 	remaining: number,
 	now: number
 ): Verdict
-	local dt = if self.lastTickAt then math.max(0, now - self.lastTickAt) else 0
+	-- A long gap since the last update (the NPC was not walking) must not count as pushing.
+	local dt = if self.lastTickAt then math.clamp(now - self.lastTickAt, 0, 0.5) else 0
 	self.lastTickAt = now
 
 	if now < self.suppressedUntil then

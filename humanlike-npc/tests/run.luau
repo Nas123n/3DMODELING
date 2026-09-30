@@ -11,6 +11,7 @@ local suites = {
 	require("./Rng.spec"),
 	require("./NavGrid.spec"),
 	require("./Names.spec"),
+	require("./ChatCorpus.spec"),
 }
 
 for _, suite in suites do

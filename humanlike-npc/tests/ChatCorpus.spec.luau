@@ -1,6 +1,6 @@
 return function(T, Loader)
 	local session = Loader.new()
-	local ChatCorpus = session.require(session.game.ServerStorage.HumanlikeNpc.ChatCorpus)
+	local ChatCorpus = session.require(session.game.ServerStorage.HumanlikeNpc.Chat.ChatCorpus)
 
 	T.describe("ChatCorpus", function()
 		T.it("has a few hundred lines spread over every category", function()

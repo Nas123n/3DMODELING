@@ -9,10 +9,12 @@ local T = require("./T")
 
 local suites = {
 	require("./Rng.spec"),
+	require("./Timing.spec"),
 	require("./NavGrid.spec"),
 	require("./Names.spec"),
 	require("./ChatCorpus.spec"),
 	require("./ChatStyle.spec"),
+	require("./WaypointFollower.spec"),
 }
 
 for _, suite in suites do

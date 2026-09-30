@@ -4,7 +4,7 @@ return function(T, Loader)
 	local Vector3 = roblox.Vector3
 
 	local session = Loader.new()
-	local NavGrid = session.require(session.game.ServerStorage.HumanlikeNpc.NavGrid)
+	local NavGrid = session.require(session.game.ServerStorage.HumanlikeNpc.Nav.NavGrid)
 
 	-- A flat 40x40 grid at cell size 2, all walkable at y = 0.
 	local function openGrid()

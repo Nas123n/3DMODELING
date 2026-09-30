@@ -11,7 +11,7 @@
 -- optional online check (Players:GetUserIdFromNameAsync) in the Roblox adapter to drop any
 -- collision with an existing account. A Pool hands out unique names per server.
 
-local Rng = require(script.Parent.Rng)
+local Rng = require(script.Parent.Parent.Rng)
 
 type Rng = Rng.Rng
 

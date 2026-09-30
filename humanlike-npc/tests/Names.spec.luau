@@ -1,7 +1,7 @@
 return function(T, Loader)
 	local session = Loader.new()
 	local Rng = session.require(session.game.ServerStorage.HumanlikeNpc.Rng)
-	local Names = session.require(session.game.ServerStorage.HumanlikeNpc.Names)
+	local Names = session.require(session.game.ServerStorage.HumanlikeNpc.Identity.Names)
 
 	T.describe("Names", function()
 		T.it("validates usernames like Roblox does", function()

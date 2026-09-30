@@ -1,7 +1,7 @@
 return function(T, Loader)
 	local session = Loader.new()
 	local Rng = session.require(session.game.ServerStorage.HumanlikeNpc.Rng)
-	local ChatStyle = session.require(session.game.ServerStorage.HumanlikeNpc.ChatStyle)
+	local ChatStyle = session.require(session.game.ServerStorage.HumanlikeNpc.Chat.ChatStyle)
 
 	local function tidyVoice(profile)
 		return {

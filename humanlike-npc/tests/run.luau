@@ -18,6 +18,7 @@ local suites = {
 	require("./NavRuntime.spec"),
 	require("./Human.spec"),
 	require("./Humanizer.spec"),
+	require("./Planner.spec"),
 }
 
 for _, suite in suites do

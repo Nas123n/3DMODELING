@@ -65,9 +65,13 @@ end
 function Scenes.ramp(parent: any, from: any, to: any, width: number?): any
 	local w = width or 8
 	local mid = (from + to) / 2
-	local length = (to - from).Magnitude
-	local cf = CFrame.lookAt(mid, to) * CFrame.new(0, -0.5, 0)
-	return block(parent, "Ramp", cf, Vector3.new(w, 1, length))
+	local delta = to - from
+	local run = math.sqrt(delta.X * delta.X + delta.Z * delta.Z)
+	-- Explicit yaw then pitch: Lune's CFrame.lookAt ignores the vertical part of the direction.
+	local yaw = math.atan2(-delta.X, -delta.Z)
+	local pitch = math.atan2(delta.Y, run)
+	local cf = CFrame.new(mid) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0) * CFrame.new(0, -0.5, 0)
+	return block(parent, "Ramp", cf, Vector3.new(w, 1, delta.Magnitude))
 end
 
 -- A raised platform whose top surface is at `top`.

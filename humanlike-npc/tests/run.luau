@@ -9,6 +9,7 @@ local T = require("./T")
 
 local suites = {
 	require("./Rng.spec"),
+	require("./NavGrid.spec"),
 }
 
 for _, suite in suites do

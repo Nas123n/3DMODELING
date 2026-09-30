@@ -748,6 +748,14 @@ function Brain.step(self: BrainT, input: Input): Output
 				end
 				local forced = pending ~= nil or status ~= "running" or self.forceReselect
 				local chosen = Utility.select(scored, current, persona, rng, forced)
+				-- Landing on what is already running (same activity, same target) is no change of
+				-- mind: the activity keeps its state and its trip instead of starting over.
+				if chosen and current and chosen ~= current and status == "running" then
+					local picked, running = chosen.candidate, (current :: Scored).candidate
+					if picked.activity == running.activity and picked.target == running.target then
+						chosen = current
+					end
+				end
 				if chosen and chosen ~= current then
 					local previous = self.activity
 					if previous then

@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Instance, Vector3, CFrame = roblox.Instance, roblox.Vector3, roblox.CFrame
 
 	local session = Loader.new()
@@ -569,8 +570,8 @@ return function(T, Loader)
 			T.equal(#Scan.props(gauntlet, true), 0, "nothing in the gauntlet reads as a crate")
 			T.check(not registry:isAvoided(g.bypass + Vector3.new(0, 1, 0)), "the bypass is outside the strip")
 
-			local grid = NavGrid.new({ minX = -20, minZ = 0, maxX = 20, maxZ = 160, cellSize = 2 })
-			local walkable = grid:sample(world.world, { avoid = Scan.avoidParts(gauntlet) })
+			-- The gauntlet grid is sampled once per process and shared with Integration (FakeWorld's cache).
+			local grid, walkable = FakeWorld.sampledGrid(world, "gauntlet", gauntlet)
 			T.check(walkable > 1000, `only {walkable} walkable cells`)
 			local rx, rz = grid:cellOf(Vector3.new(0, 0, 60))
 			local rampY = grid:floorAt(rx, rz)

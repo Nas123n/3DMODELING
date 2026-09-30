@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Sim = require("../tools/lune/Sim")
 	local Vector3 = roblox.Vector3
 
@@ -13,9 +14,8 @@ return function(T, Loader)
 	local Humanizer = session.require(session.game.ServerStorage.HumanlikeNpc.Human.Humanizer)
 
 	local world = Loader.new()
-	local _, made = Scenes.arena(world)
-	local grid = NavGrid.new({ minX = -60, minZ = -60, maxX = 60, maxZ = 60, cellSize = 2 })
-	grid:sample(world.world, { avoid = { made.avoid } })
+	local model, made = Scenes.arena(world)
+	local grid = FakeWorld.sampledGrid(world, "arena", model) -- sampled once per process, shared
 
 	local function walkableCheck(point)
 		local ix, iz = grid:cellOf(point)

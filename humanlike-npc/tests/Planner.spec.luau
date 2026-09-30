@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Vector3, CFrame = roblox.Vector3, roblox.CFrame
 
 	local session = Loader.new()
@@ -12,9 +13,8 @@ return function(T, Loader)
 	local Scheduler = session.require(session.game.ServerStorage.HumanlikeNpc.Runtime.Scheduler)
 
 	local world = Loader.new()
-	local _, made = Scenes.arena(world)
-	local grid = NavGrid.new({ minX = -60, minZ = -60, maxX = 60, maxZ = 60, cellSize = 2 })
-	grid:sample(world.world, { avoid = { made.avoid } })
+	local model, made = Scenes.arena(world)
+	local grid = FakeWorld.sampledGrid(world, "arena", model) -- sampled once per process, shared
 
 	local pois = PoiRegistry.new()
 	for _, name in { "shop", "hangoutA", "hangoutB", "viewpoint" } do

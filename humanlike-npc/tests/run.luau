@@ -41,7 +41,9 @@ local suites = {
 	require("./Safety.spec"),
 	require("./Shared.spec"),
 	require("./Npc.spec"),
+	require("./NpcService.spec"),
 	require("./TellScore.spec"),
+	require("./Leak.spec"),
 	require("./LoadAll.spec"),
 	require("./Integration.spec"),
 }

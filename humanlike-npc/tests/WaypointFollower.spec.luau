@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Sim = require("../tools/lune/Sim")
 	local Vector3 = roblox.Vector3
 
@@ -166,9 +167,8 @@ return function(T, Loader)
 
 		T.it("follows a real grid path across the arena, ramp included", function()
 			local world = Loader.new()
-			local _, made = Scenes.arena(world)
-			local grid = NavGrid.new({ minX = -60, minZ = -60, maxX = 60, maxZ = 60, cellSize = 2 })
-			grid:sample(world.world, { avoid = { made.avoid } })
+			local model, made = Scenes.arena(world)
+			local grid = FakeWorld.sampledGrid(world, "arena", model) -- sampled once per process, shared
 			local start = made.spawn.CFrame.Position
 			local goal = made.viewpoint.CFrame.Position
 			local result = grid:findPath(start, goal, { jumpHeight = 0 })

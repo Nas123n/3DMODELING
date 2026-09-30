@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Vector3 = roblox.Vector3
 
 	local session = Loader.new()
@@ -177,9 +178,10 @@ return function(T, Loader)
 
 	T.describe("NavGrid sampling from a world", function()
 		local world = Loader.new()
-		local _, made = Scenes.arena(world)
-		local grid = NavGrid.new({ minX = -60, minZ = -60, maxX = 60, maxZ = 60, cellSize = 2 })
-		local walkable = grid:sample(world.world, { avoid = { made.avoid } })
+		local model, made = Scenes.arena(world)
+		-- The arena grid is sampled once per process and shared with the other suites (FakeWorld's cache);
+		-- this suite is the first to ask, so the sampling happens here.
+		local grid, walkable = FakeWorld.sampledGrid(world, "arena", model)
 
 		T.it("finds the floor, sees pillar tops as jump-up surfaces, keeps the platform and ramp", function()
 			T.check(walkable > 2000, `only {walkable} walkable cells`)

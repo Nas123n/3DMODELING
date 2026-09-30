@@ -1,6 +1,7 @@
 return function(T, Loader)
 	local roblox = require("@lune/roblox")
 	local Scenes = require("../tools/lune/Scenes")
+	local FakeWorld = require("../tools/lune/FakeWorld")
 	local Sim = require("../tools/lune/Sim")
 	local Vector3 = roblox.Vector3
 
@@ -19,9 +20,8 @@ return function(T, Loader)
 	local Report = session.require(S.Runtime.Report)
 
 	-- One arena grid for every case.
-	local _, made = Scenes.arena(session)
-	local grid = NavGrid.new({ minX = -60, minZ = -60, maxX = 60, maxZ = 60, cellSize = 2 })
-	grid:sample(session.world, { avoid = { made.avoid } })
+	local model, made = Scenes.arena(session)
+	local grid = FakeWorld.sampledGrid(session, "arena", model) -- sampled once per process, shared
 	local pois = PoiRegistry.new()
 	local spawnPart = made.spawn.CFrame.Position
 	local spawn = Vector3.new(spawnPart.X, 0, spawnPart.Z)

@@ -17,6 +17,9 @@ type Rng = Rng.Rng
 
 local Utility = {}
 
+-- Soft selection draws among this many of the best-scored candidates (§2.18).
+local SOFTMAX_TOP = 5
+
 export type Candidate = {
 	activity: string,
 	target: string?, -- entity id, poi id, group id, sector id
@@ -164,12 +167,24 @@ function Utility.select(scored: { Scored }, current: Scored?, persona: any, rng:
 			return current
 		end
 	end
+	-- Softmax over the five best (ties broken by activity name, then target, so the order never
+	-- depends on how the candidates were listed).
+	local ranked = table.clone(scored)
+	table.sort(ranked, function(a, b)
+		if a.score ~= b.score then
+			return a.score > b.score
+		end
+		if a.candidate.activity ~= b.candidate.activity then
+			return a.candidate.activity < b.candidate.activity
+		end
+		return (a.candidate.target or "") < (b.candidate.target or "")
+	end)
 	local beta = 1 / (0.3 + 0.5 * persona.impulsivity)
 	local weights = {}
-	for i, s in scored do
-		weights[i] = s.score ^ beta
+	for i = 1, math.min(SOFTMAX_TOP, #ranked) do
+		weights[i] = ranked[i].score ^ beta
 	end
-	return scored[rng:weightedIndex(weights)]
+	return ranked[rng:weightedIndex(weights)]
 end
 
 -- Interrupt resistance of a running activity (what an event must beat to be noticed).

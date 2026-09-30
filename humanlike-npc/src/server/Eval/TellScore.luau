@@ -889,7 +889,8 @@ local function analyzeAgent(id: string, kind: string, samples: { Sample }, ctx: 
 				local moved = flatDistance(s.position, previous.position)
 				if moved > TellScore.TELEPORT_FACTOR * speed * dt then
 					local exempt = false
-					for _, resetAt in resets or {} do
+					local resetTimes: { number } = resets or {}
+					for _, resetAt in resetTimes do
 						if resetAt >= previous.at - TellScore.RESET_SLACK and resetAt <= s.at then
 							exempt = true
 							break
@@ -1044,7 +1045,8 @@ end
 local function pooled(analyses: { Analysis }, feature: string): { number }
 	local out = {}
 	for _, a in analyses do
-		for _, v in a.lists[feature] or {} do
+		local values: { number } = a.lists[feature] or {}
+		for _, v in values do
 			table.insert(out, v)
 		end
 	end

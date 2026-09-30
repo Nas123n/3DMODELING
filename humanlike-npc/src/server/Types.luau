@@ -68,7 +68,9 @@ export type AgentView = {
 	isTyping: boolean?, -- typing indicator on
 }
 
-export type ChatEvent = { fromId: string, text: string, at: number, position: Vector3 }
+-- lineId: the corpus line id when an NPC said it (so an echo re-renders the corpus line, never the bytes heard);
+-- nil for a real player's line.
+export type ChatEvent = { fromId: string, text: string, at: number, position: Vector3, lineId: string? }
 
 export type Snapshot = {
 	now: number,
@@ -181,6 +183,7 @@ export type FrameStats = {
 	dropped: number, -- ticks the scheduler cap pushed to a later frame
 	wantSpawn: number, -- NPCs the population model would like to add
 	pairWith: string?, -- npc id a newly spawned NPC should arrive with, if any
+	rejoinSeed: (number | string)?, -- a departed persona's seed when one of the wanted spawns is its rejoin
 }
 
 -- Where the brain wants the body to go and why.

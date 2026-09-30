@@ -116,7 +116,10 @@ function Recovery.currentLevel(self: Ladder): number
 	return self.level
 end
 
--- Call when the goal changes: a new goal gets a fresh timeline.
+-- Call when the goal changes: a new goal gets a fresh timeline. The level and the failure memory
+-- go too: escalation (a failed episode within escalateWindow, two repaths within 60 s) is about
+-- one goal, so a fresh goal always enters the ladder at its verdict's own level, never at the
+-- level the previous goal reached (abandoning one goal must not chain into abandoning the next).
 function Recovery.onNewGoal(self: Ladder, now: number)
 	self.firstStuckOnGoalAt = nil
 	self.repathEpisodes = {}
@@ -126,6 +129,9 @@ function Recovery.onNewGoal(self: Ladder, now: number)
 	self.successDeadline = nil
 	self.waitingForPath = false
 	self.lastProgressAt = now
+	self.level = 0
+	self.lastFailureAt = -math.huge
+	self.episodeLevel = 0
 end
 
 -- Call whenever the follower reports real progress (a waypoint reached) with studs advanced.

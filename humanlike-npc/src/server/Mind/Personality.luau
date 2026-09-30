@@ -4,6 +4,15 @@
 -- players are mildly social, most never chat, jumping is bimodal), and everything downstream
 -- (the humanizer, the jump habit, the chat voice, the brain's utilities) reads its numbers from
 -- here instead of rolling its own.
+--
+-- The draw order in `sample` is pinned: the 14 traits and the derived values come from the
+-- "persona" stream, the input profile and chat voice from its "profile" and "voice" forks, and
+-- the later additions (rig, AFK style, spaces, animation pack, presentation, ...) from a
+-- "persona2" fork taken after the last draw of the first stream, so adding them changed no
+-- earlier value. Anything added later goes at the end of the "persona2" list, never before.
+--
+-- This module is pure: it reads no clock, no world and no Config (tunables such as the R6 share
+-- arrive through Options), and it decides nothing about behaviour; it only describes a person.
 
 local Rng = require(script.Parent.Parent.Rng)
 local InputProfile = require(script.Parent.Parent.Human.InputProfile)
@@ -15,6 +24,51 @@ local Personality = {}
 
 -- "kid" | "teen" | "older"
 export type Dialect = string
+
+-- Animation pack names, in a fixed order so the weighted pick never depends on table iteration.
+-- The shared AnimSets module (the per-pack asset ids the client animator plays) must use exactly
+-- these names as its pack keys; "default" is the standard R15 set every install has.
+local PACKS: { string } = {
+	"default",
+	"rthro",
+	"cartoony",
+	"levitation",
+	"ninja",
+	"toy",
+	"zombie",
+	"elder",
+	"bubbly",
+	"astronaut",
+}
+Personality.PACKS = PACKS
+
+-- Base share of each pack among the population (sums to 100; "default" is about 60%). The per
+-- persona biases live in `packWeights`.
+local PACK_WEIGHTS: { [string]: number } = {
+	default = 60,
+	rthro = 10,
+	cartoony = 8,
+	levitation = 2,
+	ninja = 4,
+	toy = 3,
+	zombie = 3,
+	elder = 3,
+	bubbly = 4,
+	astronaut = 3,
+}
+Personality.PACK_WEIGHTS = PACK_WEIGHTS
+
+-- Account age (days) below which a player still runs the default animations (they have not
+-- bought a pack yet).
+local NEWCOMER_DAYS = 30
+
+-- "sweeper" | "locked" | "twitchy" at 40 / 40 / 20.
+local CAMERA_STYLES: { string } = { "sweeper", "locked", "twitchy" }
+local CAMERA_STYLE_WEIGHTS: { number } = { 40, 40, 20 }
+
+-- "m" | "f" | "any" at 45 / 45 / 10.
+local PRESENTATIONS: { string } = { "m", "f", "any" }
+local PRESENTATION_WEIGHTS: { number } = { 45, 45, 10 }
 
 export type Persona = {
 	-- Traits in [0, 1]
@@ -47,6 +101,25 @@ export type Persona = {
 	stopBiasStuds: number,
 	aboutFaceRate: number,
 	wallBumpRate: number,
+	-- Additions drawn from the "persona2" fork, in this order (enum-like fields are plain strings)
+	sloppiness: number, -- [0, 1]: deliberate edge falls, chat typo scaling
+	restlessness: number, -- [0, 1]: pacing and wander weights
+	attachmentProneness: number, -- [0, 1]: how easily someone becomes "the friend"
+	rig: string, -- "R15" | "R6"
+	afkStyle: string, -- "full" (attention off, no fidgets) | "semi" (attention delays x3, no turning)
+	personalSpace: number, -- studs: standing ring distance from strangers
+	friendSpace: number, -- studs: standing ring distance from friends and the attachment
+	animPack: string, -- one of PACKS
+	slangSeed: number, -- integer in [1, 1e6]: chat tag/typo phrase choices
+	favoritePoiKind: string?, -- nil here; the service fills it once it knows the place's POI kinds
+	pointlessTarget: number, -- share of Wander goals that go nowhere in particular (already scaled)
+	rudenessCap: number, -- 0 (rude corpus lines never) | 1 (rude lines allowed at all)
+	sitHabit: number, -- [0, 1]: probability weight for seats at hangouts
+	cameraStyle: string, -- "sweeper" | "locked" | "twitchy": idle yaw sweep rate, shift-lock profiles only
+	presentation: string, -- "m" | "f" | "any": filters gendered hair and hats
+	-- Derived from accountAge (no draw)
+	accountAgeDays: number, -- 3 .. 3000
+	familiarity: number, -- 1 - exp(-accountAgeDays / 90): how well this person knows the platform
 }
 
 export type Options = {
@@ -56,6 +129,7 @@ export type Options = {
 	sessionMedianMinutes: number?, -- default 15
 	sessionMaxMinutes: number?, -- default 240
 	profileKind: string?, -- force an input profile
+	r6Share: number?, -- probability of an R6 rig, default 0.05 (the service passes its R6Share)
 }
 
 local function mixture(rng: Rng, parts: { { number } }): number
@@ -66,6 +140,23 @@ local function mixture(rng: Rng, parts: { { number } }): number
 	end
 	local pick = parts[rng:weightedIndex(weights)]
 	return rng:kumaraswamy(pick[2], pick[3])
+end
+
+-- Pack weights for one persona, indexed like PACKS: newcomers run the default animations three
+-- times as often (nobody buys a pack in their first month) and trolls lean to zombie and ninja.
+function Personality.packWeights(accountAgeDays: number, trolliness: number): { number }
+	local weights: { number } = {}
+	for i, name in PACKS do
+		local weight = PACK_WEIGHTS[name]
+		if name == "default" and accountAgeDays < NEWCOMER_DAYS then
+			weight *= 3
+		end
+		if trolliness > 0.7 and (name == "zombie" or name == "ninja") then
+			weight *= 2
+		end
+		weights[i] = weight
+	end
+	return weights
 end
 
 function Personality.sample(seed: Rng, options: Options?): Persona
@@ -100,8 +191,8 @@ function Personality.sample(seed: Rng, options: Options?): Persona
 
 	local profile = InputProfile.sample(rng:fork("profile"), o.profileKind)
 	local typingSkill = if dialect == "kid" then 0.15 elseif dialect == "teen" then 0.55 else 0.85
-	local sloppiness = if dialect == "kid" then 0.8 elseif dialect == "teen" then 0.45 else 0.2
-	local voice = ChatStyle.voice(rng:fork("voice"), profile.kind, typingSkill, sloppiness)
+	local voiceSloppiness = if dialect == "kid" then 0.8 elseif dialect == "teen" then 0.45 else 0.2
+	local voice = ChatStyle.voice(rng:fork("voice"), profile.kind, typingSkill, voiceSloppiness)
 
 	local jumpTier = if jumpiness < 0.25 then "never" elseif jumpiness < 0.7 then "occasional" else "spammer"
 	local reactionScale = (if dialect == "kid" then 1.3 else 1) * (0.85 + 0.3 * (1 - attention))
@@ -116,6 +207,29 @@ function Personality.sample(seed: Rng, options: Options?): Persona
 
 	local sessionLength =
 		rng:logNormalClamped((o.sessionMedianMinutes or 15) * 60, 0.9, 60, (o.sessionMaxMinutes or 240) * 60)
+	local stopBiasStuds = math.clamp(rng:gaussian(0.8, 0.5), -0.5, 2)
+
+	-- Everything below comes from its own stream, forked after the last draw above: the values
+	-- above are byte-for-byte what they were before these fields existed. Derived values first,
+	-- since they consume no draw and the pack pick needs them.
+	local rng2 = rng:fork("persona2")
+	local accountAgeDays = math.floor(3 * 1000 ^ accountAge)
+	local familiarity = 1 - math.exp(-accountAgeDays / 90)
+
+	local sloppiness = rng2:kumaraswamy(1.5, 2)
+	local restlessness = rng2:kumaraswamy(2, 2)
+	local attachmentProneness = rng2:kumaraswamy(1.2, 3)
+	local rig = if rng2:chance(o.r6Share or 0.05) then "R6" else "R15"
+	local afkStyle = if rng2:chance(0.3) then "semi" else "full"
+	local personalSpace = rng2:range(4, 8)
+	local friendSpace = rng2:range(1, 3)
+	local animPack = PACKS[rng2:weightedIndex(Personality.packWeights(accountAgeDays, trolliness))]
+	local slangSeed = rng2:int(1, 1000000)
+	local pointlessTarget = rng2:range(0.2, 0.4) * (1.5 - 0.5 * familiarity)
+	local rudenessCap = if trolliness < 0.6 then 0 else 1
+	local sitHabit = rng2:kumaraswamy(1.5, 3)
+	local cameraStyle = CAMERA_STYLES[rng2:weightedIndex(CAMERA_STYLE_WEIGHTS)]
+	local presentation = PRESENTATIONS[rng2:weightedIndex(PRESENTATION_WEIGHTS)]
 
 	return {
 		sociability = sociability,
@@ -142,9 +256,26 @@ function Personality.sample(seed: Rng, options: Options?): Persona
 		walkSpeed = walkSpeed,
 		sessionLength = sessionLength,
 		caution = patience,
-		stopBiasStuds = math.clamp(rng:gaussian(0.8, 0.5), -0.5, 2),
+		stopBiasStuds = stopBiasStuds,
 		aboutFaceRate = math.clamp(0.07 * (0.5 + impulsivity), 0.03, 0.12),
 		wallBumpRate = math.clamp(0.02 * (1.5 - skill), 0.01, 0.03),
+		sloppiness = sloppiness,
+		restlessness = restlessness,
+		attachmentProneness = attachmentProneness,
+		rig = rig,
+		afkStyle = afkStyle,
+		personalSpace = personalSpace,
+		friendSpace = friendSpace,
+		animPack = animPack,
+		slangSeed = slangSeed,
+		favoritePoiKind = nil,
+		pointlessTarget = pointlessTarget,
+		rudenessCap = rudenessCap,
+		sitHabit = sitHabit,
+		cameraStyle = cameraStyle,
+		presentation = presentation,
+		accountAgeDays = accountAgeDays,
+		familiarity = familiarity,
 	}
 end
 

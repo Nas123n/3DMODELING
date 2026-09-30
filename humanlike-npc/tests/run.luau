@@ -21,6 +21,7 @@ local suites = {
 	require("./Planner.spec"),
 	require("./Mind.spec"),
 	require("./MindCore.spec"),
+	require("./Persona.spec"),
 	require("./Senses.spec"),
 	require("./Integration.spec"),
 }

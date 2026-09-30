@@ -60,6 +60,11 @@ export type AgentView = {
 	displayName: string,
 	radius: number, -- 2
 	isMoving: boolean,
+	-- Spatial.Entity extras, so one record serves both the spatial index and the brain.
+	jumpedAt: number?, -- when this agent last left the ground by jumping
+	emoteAt: number?, -- when this agent last started an emote
+	emoteName: string?, -- the emote playing since emoteAt, nil once it ended
+	isTyping: boolean?, -- typing indicator on
 }
 
 export type ChatEvent = { fromId: string, text: string, at: number, position: Vector3 }
@@ -88,5 +93,101 @@ export type AvoidRecord = { id: string, cframe: CFrame, size: Vector3 }
 
 -- "pc" | "pcShiftLock" | "mobile" | "console"
 export type InputProfileKind = string
+
+-- "near" | "mid" | "far" | "dormant" (the scheduler's update-rate bands; Scheduler.Tier and Humanizer.Tier
+-- are the same plain string)
+export type Tier = string
+
+-- Who an NPC is for the whole session: the name pair players see, the fake account behind it, and
+-- the seed everything about it derives from.
+export type Identity = {
+	id: string, -- "npc<N>"
+	username: string,
+	displayName: string,
+	userIdLike: number?, -- a plausible UserId-shaped number for display; never a real account
+	accountAgeDays: number?, -- math.floor(3 * 1000 ^ accountAge), 3 .. 3000
+	familiarity: number?, -- 1 - exp(-accountAgeDays / 90), 0 .. 1
+	seed: (number | string)?, -- the identity's own Rng seed
+}
+
+-- Everything the rig builder needs to dress a body; catalog ids are nil when the piece is absent.
+export type AvatarSpec = {
+	rig: string, -- "R15" | "R6"
+	bodyColors: { [string]: Color3 }, -- keyed by body part name ("Head", "Torso", "LeftArm", ...)
+	skinToneIndex: number, -- index into the catalog's skin tone list
+	shirtId: number?,
+	pantsId: number?,
+	faceId: number?,
+	hairId: number?,
+	hatIds: { number },
+	scale: {
+		height: number,
+		width: number,
+		head: number,
+		depth: number,
+		proportion: number,
+		bodyType: number,
+	},
+	catalogSeed: number, -- the draw that picked the catalog pieces, so a rig can be rebuilt identically
+	animPack: string, -- animation pack name
+	primitive: boolean, -- true: built from parts (PrimitiveRig), false: from a HumanoidDescription
+	presentation: string, -- "m" | "f" | "any"
+}
+
+export type SeatRecord = {
+	id: string,
+	position: Vector3, -- floor point in front of the seat
+	poiId: string?, -- the POI this seat belongs to
+	source: any?, -- the Seat instance (adapter only; nil in tests)
+}
+
+-- A standable prop (crate, ledge, low wall) an NPC may hop onto.
+export type Prop = {
+	id: string,
+	position: Vector3, -- centre of the top surface
+	top: number, -- world Y of the top surface
+	footprint: number, -- horizontal half-extent in studs
+}
+
+-- One line an NPC said, as recorded for the trace and the tell score.
+export type Utterance = {
+	npcId: string,
+	text: string,
+	at: number,
+	target: string?, -- entity id the line was aimed at; nil = broadcast
+	category: string, -- ChatCorpus category
+	lineId: string, -- corpus line id, for anti-repetition
+}
+
+-- kinds: spawn, despawn, line, error, reset, died, frameOverBudget, gameEvent
+export type NpcEvent = {
+	kind: string,
+	npcId: string,
+	at: number,
+	data: { [string]: any }?,
+}
+
+-- What one service frame cost and what it decided, for the budget and the trace.
+export type FrameStats = {
+	ticks: number, -- NPC ticks run this frame
+	brains: number, -- brain evaluations run this frame
+	pathMs: number, -- milliseconds spent in path providers
+	tickMs: number, -- milliseconds spent ticking NPCs
+	spent: number, -- total milliseconds the service spent this frame
+	pressure: number, -- 0 .. 1+, how far over its budget the frame ran
+	npcCount: number,
+	dropped: number, -- ticks the scheduler cap pushed to a later frame
+	wantSpawn: number, -- NPCs the population model would like to add
+	pairWith: string?, -- npc id a newly spawned NPC should arrive with, if any
+}
+
+-- Where the brain wants the body to go and why.
+export type Goal = {
+	position: Vector3,
+	tolerance: number, -- studs: arrived when this close
+	priority: number,
+	reason: string, -- activity or overlay that set the goal
+	poiId: string?,
+}
 
 return {}

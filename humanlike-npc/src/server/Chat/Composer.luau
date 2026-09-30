@@ -3,7 +3,10 @@
 -- category weights shaped by mood, session phase and persona; replies come from the category
 -- the reply model chose. Every candidate is weighted down if it was heard recently anywhere on
 -- the server and out entirely if this NPC said it in the last hour; the result passes the
--- safety gate. Echoes copy a nearby message with a mutation and never verbatim.
+-- safety gate. Echoes copy a nearby message with a mutation and never verbatim. Tags narrow the
+-- candidates: a dialect-tagged line is only for that dialect, rude / poi / needsName / right /
+-- help.right lines need the matching context, and the help sub-tags share 60 / 25 / 15. This is
+-- not the reply decision (Reply), the rate limit (ChatGuard) or the corpus itself (ChatCorpus).
 
 local ChatCorpus = require(script.Parent.ChatCorpus)
 local ChatStyle = require(script.Parent.ChatStyle)
@@ -30,16 +33,22 @@ export type Context = {
 	nearbyName: string?, -- a display name for {name} slots
 	echoSource: string?, -- a heard message for {echo}
 	allowRude: boolean?,
+	poiWord: string?, -- fills {poi}; poi-tagged lines (and any line with the slot) need it
+	allowRight: boolean?, -- right-tagged lines need it (the caller allows one per NPC per 10 min)
+	dialect: string?, -- "kid" | "teen" | "older": a line tagged with a dialect is only for that dialect
+	knowsPoi: boolean?, -- help.right lines need it (familiarity > 0.5 and the POI kind was visited)
 }
 
 export type Composed = {
 	text: string,
 	lineId: string,
 	category: string,
-	tagged: boolean,
+	tagged: boolean, -- rendered as a tag-only message ("# #")
+	rude: boolean, -- the chosen line carries the rude tag
+	right: boolean, -- the chosen line carries the right tag (the caller starts its 10 min timer)
 }
 
--- Base shares of spontaneous categories.
+-- Base shares of spontaneous categories, in a fixed order so draws are reproducible.
 local SPONTANEOUS: { { category: string, weight: number } } = {
 	{ category = "greeting", weight = 10 },
 	{ category = "question", weight = 12 },
@@ -51,6 +60,19 @@ local SPONTANEOUS: { { category: string, weight: number } } = {
 	{ category = "compliment", weight = 3 },
 	{ category = "game", weight = 14 },
 }
+
+-- The same shares by category name, for readers; the ordered list above drives the draw.
+local spontaneousByName: { [string]: number } = {}
+for _, entry in SPONTANEOUS do
+	spontaneousByName[entry.category] = entry.weight
+end
+Composer.SPONTANEOUS = spontaneousByName
+
+local DIALECTS = { "kid", "teen", "older" }
+
+-- Shares of the help sub-tags (a real player who does not know the place answers vaguely or
+-- wrongly far more often than correctly); an untagged help line counts as vague.
+local HELP_SHARES: { [string]: number } = { vague = 60, wrong = 25, right = 15 }
 
 local function categoryWeights(ctx: Context): ({ string }, { number })
 	local names, weights = {}, {}
@@ -92,6 +114,69 @@ local function lineId(line: Line): string
 	return line.category .. ":" .. line.text
 end
 
+local function hasDialectTag(line: Line): boolean
+	for _, dialect in DIALECTS do
+		if ChatCorpus.hasTag(line, dialect) then
+			return true
+		end
+	end
+	return false
+end
+
+-- "right" | "wrong" | "vague" (the default for a line without a help sub-tag).
+local function helpGroup(line: Line): string
+	if ChatCorpus.hasTag(line, "help.right") then
+		return "right"
+	elseif ChatCorpus.hasTag(line, "help.wrong") then
+		return "wrong"
+	end
+	return "vague"
+end
+
+-- Whether a line may be said in this context; every rule is a no-op for a line without the tag.
+local function fits(line: Line, ctx: Context): boolean
+	if ChatCorpus.hasTag(line, "needsName") and not ctx.nearbyName then
+		return false
+	end
+	if ChatCorpus.hasTag(line, "rude") and not ctx.allowRude then
+		return false
+	end
+	if string.find(line.text, "{echo}", 1, true) and not ctx.echoSource then
+		return false
+	end
+	if (ChatCorpus.hasTag(line, "poi") or string.find(line.text, "{poi}", 1, true)) and not ctx.poiWord then
+		return false
+	end
+	if ChatCorpus.hasTag(line, "right") and not ctx.allowRight then
+		return false
+	end
+	if ChatCorpus.hasTag(line, "help.right") and not ctx.knowsPoi then
+		return false
+	end
+	if ctx.dialect and hasDialectTag(line) and not ChatCorpus.hasTag(line, ctx.dialect :: string) then
+		return false
+	end
+	return true
+end
+
+-- Scales candidate weights so the help sub-tag groups present share 60 / 25 / 15 whatever their
+-- line counts. Untouched when no candidate carries a wrong or right sub-tag.
+local function applyHelpShares(candidates: { Line }, weights: { number })
+	local counts: { [string]: number } = { vague = 0, wrong = 0, right = 0 }
+	local groups: { string } = {}
+	for i, line in candidates do
+		local group = helpGroup(line)
+		groups[i] = group
+		counts[group] += 1
+	end
+	if counts.wrong == 0 and counts.right == 0 then
+		return
+	end
+	for i, group in groups do
+		weights[i] *= HELP_SHARES[group] / counts[group]
+	end
+end
+
 -- Mutates a copied message the way kids copy each other: an extra letter, a neighbour key, a
 -- dropped last letter.
 function Composer.mutateEcho(text: string, rng: Rng): string
@@ -131,18 +216,16 @@ function Composer.compose(ctx: Context, recency: Recency.Tracker, safety: Safety
 	end
 	local candidates: { Line } = {}
 	local weights: { number } = {}
+	local mobileVoice = ctx.voice.profile == "mobile"
 	for _, line in pool do
-		if ChatCorpus.hasTag(line, "needsName") and not ctx.nearbyName then
-			continue
-		end
-		if ChatCorpus.hasTag(line, "rude") and not ctx.allowRude then
-			continue
-		end
-		if string.find(line.text, "{echo}", 1, true) and not ctx.echoSource then
+		if not fits(line, ctx) then
 			continue
 		end
 		local w = recency:weight(lineId(line), ctx.npcId, ctx.now)
 		if w > 0 then
+			if mobileVoice and ChatCorpus.hasTag(line, "mobile") then
+				w *= 2
+			end
 			table.insert(candidates, line)
 			table.insert(weights, w)
 		end
@@ -150,6 +233,7 @@ function Composer.compose(ctx: Context, recency: Recency.Tracker, safety: Safety
 	if #candidates == 0 then
 		return nil
 	end
+	applyHelpShares(candidates, weights)
 	local line = candidates[rng:weightedIndex(weights)]
 	local slots: { [string]: string } = {}
 	if ctx.nearbyName then
@@ -158,6 +242,9 @@ function Composer.compose(ctx: Context, recency: Recency.Tracker, safety: Safety
 	if ctx.echoSource then
 		slots.echo = Composer.mutateEcho(ctx.echoSource, rng)
 	end
+	if ctx.poiWord then
+		slots.poi = ctx.poiWord
+	end
 	local text = ChatStyle.render(line.text, ctx.voice, rng, slots)
 	if #text == 0 or not safety:check(text) then
 		return nil
@@ -165,7 +252,14 @@ function Composer.compose(ctx: Context, recency: Recency.Tracker, safety: Safety
 	local id = lineId(line)
 	recency:record(id, ctx.npcId, ctx.now)
 	local tagged = string.match(text, "^[# ]+$") ~= nil
-	return { text = text, lineId = id, category = category :: string, tagged = tagged }
+	return {
+		text = text,
+		lineId = id,
+		category = category :: string,
+		tagged = tagged,
+		rude = ChatCorpus.hasTag(line, "rude"),
+		right = ChatCorpus.hasTag(line, "right"),
+	}
 end
 
 return Composer

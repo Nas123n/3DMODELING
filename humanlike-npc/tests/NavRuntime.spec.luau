@@ -118,6 +118,96 @@ return function(T, Loader)
 				now += 0.1
 			end
 		end)
+
+		local planted = {
+			position = Vector3.new(0, 0, 0),
+			velocity = Vector3.zero,
+			onGround = true,
+			state = "Running",
+			walkSpeed = 16,
+			yaw = 0,
+		}
+
+		T.it("oscillating after three reversals in 2 s", function()
+			local detector = StuckDetector.new()
+			local first = nil
+			for i = 0, 30 do
+				local now = i * 0.1
+				-- The intended direction flips every 0.4 s; the body goes nowhere.
+				local dir = if (i // 4) % 2 == 0 then Vector3.new(1, 0, 0) else Vector3.new(-1, 0, 0)
+				local verdict = detector:update(planted, 16, 30, now, dir)
+				if verdict == "oscillating" and not first then
+					first = now
+				end
+			end
+			T.check(first ~= nil, "oscillation detected")
+			T.near(first, 1.6, 1e-6, `oscillating at {first}`)
+			-- A steady heading with the same lack of progress is stuck or pushing, never oscillating.
+			local steady = StuckDetector.new()
+			for i = 0, 30 do
+				local verdict = steady:update(planted, 16, 30, i * 0.1, Vector3.new(1, 0, 0))
+				T.check(verdict ~= "oscillating", "no reversals, no oscillation")
+			end
+			-- Suppression clears the history: a scripted about-face is not a reversal.
+			local scripted = StuckDetector.new()
+			for i = 0, 30 do
+				local now = i * 0.1
+				if i == 8 then
+					scripted:suppress(now, now + 0.5)
+				end
+				local dir = if (i // 4) % 2 == 0 then Vector3.new(1, 0, 0) else Vector3.new(-1, 0, 0)
+				T.check(scripted:update(planted, 16, 30, now, dir) ~= "oscillating" or now >= 2.5, `at {now}`)
+			end
+		end)
+
+		T.it("wallCapped after 3 s of pushing", function()
+			local detector = StuckDetector.new()
+			local first, firstPush = nil, nil
+			for i = 0, 40 do
+				local now = i * 0.1
+				local verdict = detector:update(planted, 16, 30, now, Vector3.new(0, 0, -1))
+				if verdict == "pushing" and not firstPush then
+					firstPush = now
+				end
+				if verdict == "wallCapped" and not first then
+					first = now
+				elseif now < 2.9 then
+					T.check(verdict ~= "wallCapped", `too early at {now}`)
+				end
+			end
+			T.between(firstPush, 0.6, 0.71, `pushing at {firstPush}`)
+			T.check(first ~= nil, "wall capped")
+			T.between(first, 3, 3.11, `wall capped at {first}`)
+			-- A crowd that lets the body through resets the count.
+			local crowd = StuckDetector.new()
+			local moving = table.clone(planted)
+			moving.velocity = Vector3.new(0, 0, -16)
+			for i = 0, 60 do
+				local now = i * 0.1
+				local body = if i % 20 == 19 then moving else planted
+				T.check(crowd:update(body, 16, 30, now, Vector3.new(0, 0, -1)) ~= "wallCapped", `at {now}`)
+			end
+		end)
+
+		T.it("moving along the intended direction counts as progress when remaining is stale", function()
+			local detector = StuckDetector.new()
+			local body = table.clone(planted)
+			body.velocity = Vector3.new(16, 0, 0)
+			for i = 0, 40 do
+				local now = i * 0.1
+				body.position = Vector3.new(16 * now, 0, 0)
+				T.equal(detector:update(body, 16, 30, now, Vector3.new(1, 0, 0)), "ok", `at {now}`)
+			end
+			-- The same motion sideways to the intended direction is a wall slide: stuck.
+			local sliding = StuckDetector.new()
+			local verdict = "ok"
+			for i = 0, 40 do
+				local now = i * 0.1
+				body.position = Vector3.new(16 * now, 0, 0)
+				verdict = sliding:update(body, 16, 30, now, Vector3.new(0, 0, -1))
+			end
+			T.equal(verdict, "stuck")
+		end)
 	end)
 
 	T.describe("Steering", function()
@@ -219,6 +309,68 @@ return function(T, Loader)
 			end
 			T.between(ignored / 200, 0.35, 0.65)
 		end)
+
+		T.it("pushOnlyBlocking ignores a neighbour walking the same way", function()
+			-- A companion 3 studs aside at the same velocity: a collision course by the plain rule
+			-- (closest approach 3 < 5), but nobody is about to hit anybody.
+			local function input(now)
+				return {
+					dir = Vector3.new(0, 0, -1),
+					magnitude = 1,
+					position = Vector3.new(0, 0, 0),
+					velocity = Vector3.new(0, 0, -16),
+					neighbors = { agent("a", 3, 0, 0, -16) },
+					now = now,
+				}
+			end
+			local plain = Steering.new(Rng.new(5), { ignoreChance = 0 })
+			T.check(math.abs(plain:adjust(input(0)).dir.X) > 0.1, "the plain rule drifts for a companion")
+			local steer = Steering.new(Rng.new(5), { ignoreChance = 0, pushOnlyBlocking = true })
+			local out = steer:adjust(input(0))
+			T.near(out.dir.X, 0, 1e-6, "dir unchanged")
+			T.near(out.dir.Z, -1, 1e-6, "dir unchanged")
+			T.equal(out.blockedBy, nil, "nobody in the way")
+			T.near(out.magnitude, 1, 1e-6, "full speed")
+			-- Someone standing right in front still shoves, whatever the velocities say.
+			local shoved = steer:adjust({
+				dir = Vector3.new(0, 0, -1),
+				magnitude = 1,
+				position = Vector3.new(0, 0, 0),
+				velocity = Vector3.zero,
+				neighbors = { agent("b", 0, -3.5, 0, 0) },
+				now = 1,
+			})
+			T.equal(shoved.blockedBy, "b")
+			T.near(shoved.magnitude, 0.6, 1e-6, "slowed by the shove")
+		end)
+
+		T.it("pushOnlyBlocking still dodges a head-on neighbour", function()
+			-- Closest approach in 0.4 s, closing at 8 studs/s: about to collide.
+			local steer = Steering.new(Rng.new(6), { ignoreChance = 0, pushOnlyBlocking = true })
+			local out = steer:adjust({
+				dir = Vector3.new(0, 0, -1),
+				magnitude = 1,
+				position = Vector3.new(0, 0, 0),
+				velocity = Vector3.new(0, 0, -4),
+				neighbors = { agent("a", 0.3, -3.2, 0, 4) },
+				now = 0,
+			})
+			T.check(math.abs(out.dir.X) > 0.3, `lateral component, got {out.dir}`)
+			T.check(out.dir.Z < -0.7, "but keep mostly heading forward")
+			T.check(not out.wantsJump)
+			-- Closest approach in 0.5 s but closing at only 3 studs/s: walked into, not dodged.
+			local slow = Steering.new(Rng.new(6), { ignoreChance = 0, pushOnlyBlocking = true })
+			local through = slow:adjust({
+				dir = Vector3.new(0, 0, -1),
+				magnitude = 1,
+				position = Vector3.new(0, 0, 0),
+				velocity = Vector3.new(0, 0, -3),
+				neighbors = { agent("a", 0.3, -1.5, 0, 0) },
+				now = 0,
+			})
+			T.near(through.dir.X, 0, 1e-6, "no drift for a slow approach")
+			T.equal(through.blockedBy, "a", "but the shove still applies")
+		end)
 	end)
 
 	T.describe("Recovery", function()
@@ -307,6 +459,48 @@ return function(T, Loader)
 			runEpisode(slow, 0)
 			slow:onStuck(30, body, forward, "stuck") -- 30 s on the same goal
 			T.equal(slow:currentLevel(), 4)
+		end)
+
+		T.it("oscillating enters at the back-and-jump level like pushing", function()
+			local ladder = Recovery.new(Rng.new(5))
+			T.equal(ladder:onStuck(0, body, forward, "oscillating", 3, 1), 1)
+			local kinds = runEpisode(ladder, 0)
+			T.equal(kinds[1], "pause")
+			T.equal(kinds[2], "backup")
+			T.equal(kinds[3], "face")
+			T.equal(kinds[4], "jump")
+			-- Still dithering soon after: escalates like any failed episode.
+			T.equal(ladder:onStuck(5, body, forward, "oscillating"), 2)
+		end)
+
+		T.it("wallCapped enters at the repath level, and a second within 60 s abandons", function()
+			local ladder = Recovery.new(Rng.new(6))
+			T.equal(ladder:onStuck(0, body, forward, "wallCapped", 3, 1), 2)
+			local kinds, t = runEpisode(ladder, 0)
+			T.equal(kinds[1], "pause")
+			T.equal(kinds[2], "repath")
+			T.check(t > 5 and t < 8, `waits for the path then gives up after 5 s (took {t})`)
+			ladder:onPathArrived()
+			-- 20 s later the escalation window has lapsed, yet the wall is still there: give up.
+			T.equal(ladder:onStuck(20, body, forward, "wallCapped"), 3)
+			local k3 = runEpisode(ladder, 20)
+			T.equal(k3[#k3], "abandon")
+			-- After clean progress the level is back at 0, but a capped wall still skips the nudge and the hop.
+			local fresh = Recovery.new(Rng.new(7))
+			fresh:onStuck(0, body, forward, "stuck")
+			runEpisode(fresh, 0)
+			fresh:onProgress(30, 40)
+			T.equal(fresh:currentLevel(), 0)
+			T.equal(fresh:onStuck(31, body, forward, "wallCapped"), 2)
+		end)
+
+		T.it("an unknown verdict is handled as stuck", function()
+			local ladder = Recovery.new(Rng.new(8))
+			T.equal(ladder:onStuck(0, body, forward, "somethingNew", 3, 1), 0)
+			local kinds = runEpisode(ladder, 0)
+			T.equal(kinds[1], "pause")
+			T.equal(kinds[2], "sidestep")
+			T.equal(kinds[3], "forward")
 		end)
 
 		T.it("converts actions to move commands", function()

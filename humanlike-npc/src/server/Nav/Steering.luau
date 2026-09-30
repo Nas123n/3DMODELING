@@ -4,8 +4,13 @@
 -- and after a moment either a hop over them, a step around, or just waiting. Nobody paths around
 -- every individual in a crowd, and about a third of the time the NPC does not bother at all.
 --
+-- With `pushOnlyBlocking` the drift is reserved for neighbours about to hit: close in time and
+-- closing fast, never someone walking the same way. Humans push through a crowd and dodge only
+-- what is about to collide with them. The shove and the blocked reaction are unchanged by it.
+--
 -- Pure: takes the desired direction, the neighbours from the perception snapshot and the clock,
 -- returns an adjusted direction and whether it wants to jump.
+-- requires: NavMath, Rng, Types
 
 local NavMath = require(script.Parent.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -27,6 +32,11 @@ export type Options = {
 	blockedJumpAfter: number?, -- seconds blocked before reacting; default 0.7
 	jumpShare: number?, -- share of reactions that are a hop over; default 0.7
 	sideBias: number?, -- -1 or 1: which way this NPC tends to dodge
+	-- Only drift for a neighbour predicted to block (see ttcBlock / closingMin), never for one
+	-- walking the same way; default false (the drift applies to every collision course).
+	pushOnlyBlocking: boolean?,
+	ttcBlock: number?, -- seconds to closest approach under which a neighbour blocks; default 0.6
+	closingMin: number?, -- studs/s of closing speed above which a neighbour blocks; default 4
 }
 
 export type Input = {
@@ -61,6 +71,9 @@ export type Steerer = typeof(setmetatable(
 		blockedJumpAfter: number,
 		jumpShare: number,
 		sideBias: number,
+		pushOnlyBlocking: boolean,
+		ttcBlock: number,
+		closingMin: number,
 		ignored: { [string]: number }, -- id -> decided-until time (true = ignoring)
 		ignoreDecision: { [string]: boolean },
 		blockedSince: { [string]: number },
@@ -81,6 +94,9 @@ function Steering.new(rng: Rng, options: Options?): Steerer
 		blockedJumpAfter = o.blockedJumpAfter or 0.7,
 		jumpShare = o.jumpShare or 0.7,
 		sideBias = o.sideBias or rng:sign(),
+		pushOnlyBlocking = o.pushOnlyBlocking == true,
+		ttcBlock = o.ttcBlock or 0.6,
+		closingMin = o.closingMin or 4,
 		ignored = {},
 		ignoreDecision = {},
 		blockedSince = {},
@@ -95,6 +111,35 @@ local function ignores(self: Steerer, id: string, now: number): boolean
 		self.ignoreDecision[id] = self.rng:chance(self.ignoreChance)
 	end
 	return self.ignoreDecision[id] == true
+end
+
+local SAME_WAY_DOT = 0.5 -- cosine between the two velocities above which they walk the same way
+local SAME_WAY_CLOSING = 2 -- studs/s: closing slower than this while heading the same way is a companion
+
+-- Whether a neighbour on a collision course earns a drift. Without `pushOnlyBlocking` every one
+-- does; with it only a neighbour about to block: closest approach within `ttcBlock` and closing
+-- faster than `closingMin`, and never a neighbour walking the same way at about the same pace.
+-- `rel` is the flat offset to the neighbour, `relV` the neighbour's flat velocity relative to us.
+local function pushes(
+	self: Steerer,
+	rel: Vector3,
+	distance: number,
+	relV: Vector3,
+	ttc: number,
+	myV: Vector3,
+	nV: Vector3
+): boolean
+	if not self.pushOnlyBlocking then
+		return true
+	end
+	local closing = -rel:Dot(relV) / distance -- positive while the gap shrinks
+	local mine, theirs = NavMath.flat(myV), NavMath.flat(nV)
+	if mine.Magnitude > 1e-6 and theirs.Magnitude > 1e-6 then
+		if mine.Unit:Dot(theirs.Unit) > SAME_WAY_DOT and closing < SAME_WAY_CLOSING then
+			return false
+		end
+	end
+	return ttc < self.ttcBlock and closing > self.closingMin
 end
 
 function Steering.adjust(self: Steerer, input: Input): Output
@@ -131,10 +176,12 @@ function Steering.adjust(self: Steerer, input: Input): Output
 		if ignores(self, n.id, input.now) then
 			continue
 		end
-		local side = d:Cross(rel).Y
-		side = if math.abs(side) < 1e-6 then self.sideBias else (if side > 0 then 1 else -1)
-		local weight = (1 - distance / self.range) * (1 - ttc / self.ttcHorizon)
-		lateral -= side * weight
+		if pushes(self, rel, distance, relV, ttc, input.velocity, n.velocity) then
+			local side = d:Cross(rel).Y
+			side = if math.abs(side) < 1e-6 then self.sideBias else (if side > 0 then 1 else -1)
+			local weight = (1 - distance / self.range) * (1 - ttc / self.ttcHorizon)
+			lateral -= side * weight
+		end
 		if distance < 2 * self.radius + 0.3 and rel.Unit:Dot(d) > 0.7 then
 			blockedBy = n.id
 			blockedRel = rel

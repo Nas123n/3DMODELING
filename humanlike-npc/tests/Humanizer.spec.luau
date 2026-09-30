@@ -122,6 +122,79 @@ return function(T, Loader)
 		return n
 	end
 
+	-- A hand-built path: each entry is { position, action? } (Walk unless given).
+	local function path(points)
+		local waypoints = {}
+		for _, p in points do
+			table.insert(waypoints, { position = p[1], action = p[2] or "Walk" })
+		end
+		return waypoints
+	end
+
+	-- Drives a humanizer over a ready follower and body until the trip ends or `seconds` pass.
+	-- `onEvent(kind, now)` runs for every humanizer event so a case can poke the follower
+	-- mid-event. Records event kinds, the windows in which the humanizer was busy and the body's
+	-- position each tick, so a case can look at what the body did while an event ran.
+	local function drive(humanizer, follower, body, seconds, onEvent)
+		local now, dt = 0, 0.1
+		local stats = { events = {}, busy = {}, trace = {}, finished = false, abandoned = false }
+		local busySince = nil
+		while now < seconds do
+			local out = follower:tick(body:state(), now)
+			for _, e in out.events do
+				if e.kind == "jumpFailed" then
+					follower:resume()
+				end
+			end
+			local h = humanizer:apply({
+				command = out.command,
+				body = body:state(),
+				now = now,
+				dt = dt,
+				followerEvents = out.events,
+			})
+			for _, e in h.events do
+				table.insert(stats.events, e.kind)
+				if onEvent then
+					onEvent(e.kind, now)
+				end
+			end
+			if humanizer:isBusy() then
+				busySince = busySince or now
+			elseif busySince then
+				table.insert(stats.busy, { from = busySince, to = now })
+				busySince = nil
+			end
+			table.insert(stats.trace, { at = now, position = body.position })
+			if h.abandonTrip then
+				stats.abandoned = true
+				break
+			end
+			if follower:isFinished() and not humanizer:isBusy() then
+				stats.finished = true
+				break
+			end
+			body:step(h.command, dt)
+			now += dt
+		end
+		if busySince then
+			table.insert(stats.busy, { from = busySince, to = now })
+		end
+		stats.elapsed = now
+		return stats
+	end
+
+	-- The largest value of `measure(position)` over the ticks inside a busy window.
+	local function peakDuring(stats, window, measure)
+		local peak = -math.huge
+		for _, entry in stats.trace do
+			if entry.at >= window.from and entry.at <= window.to then
+				peak = math.max(peak, measure(entry.position))
+			end
+		end
+		return peak
+	end
+
 	local start = made.spawn.CFrame.Position
 	local shop = made.shop.CFrame.Position
 
@@ -279,6 +352,198 @@ return function(T, Loader)
 			end
 			T.check(bumps <= 8, `wall bumps per 100 trips: {bumps}`)
 			T.between(faces, 1, 20, `about-faces per 100 trips: {faces}`)
+		end)
+
+		-- Bounded events: the fixes of the spec's "Humanizer EXTEND" item. Each case forces one
+		-- event, makes it go wrong the way it did in the field, and checks the trip still ends
+		-- with the follower running.
+		local quiet =
+			{ skill = 0.5, caution = -0.5, impulsivity = 0, stopBiasStuds = 0.8, aboutFaceRate = 0, wallBumpRate = 0 }
+
+		T.it("an about-face that cannot walk back gives up after 4 s and hands the trip back", function()
+			local from, to = Vector3.new(0, 0, 0), Vector3.new(120, 0, 0)
+			local finished, abandoned = 0, 0
+			for seed = 400, 409 do
+				local rng = Rng.new(seed)
+				local profile = InputProfile.sample(rng:fork("profile"), "mobile")
+				local p = table.clone(quiet)
+				p.aboutFaceRate = 1
+				local humanizer = Humanizer.new(rng:fork("human"), profile, p)
+				local follower = WaypointFollower.new(path({ { from }, { to } }), from, 0)
+				humanizer:beginTrip(follower, 0, seed)
+				-- A one-way floor: while the humanizer has the wheel the body cannot move back
+				-- toward the start, which is what a wall across the rewound line looks like.
+				local body
+				body = Sim.new(from, {
+					blockedAt = function(x, _z)
+						return humanizer:isBusy() and x < body.position.X - 0.05
+					end,
+				})
+				local stats = drive(humanizer, follower, body, 30)
+				T.equal(count(stats.events, "aboutFace"), 1, `seed {seed} turned around`)
+				T.check(stats.finished or stats.abandoned, `seed {seed} ends the trip`)
+				T.check(not follower:isPaused(), `seed {seed} leaves the follower running`)
+				local window = stats.busy[1]
+				T.check(window ~= nil, `seed {seed} was busy with the about-face`)
+				-- The brief stop of phase 1, then the 4 s walk-back limit, then straight back to the follower.
+				T.between(window.to - window.from, 4, 4.6, `seed {seed} gave up after the limit`)
+				if stats.finished then
+					finished += 1
+					T.check(NavMath.flatDistance(body.position, to) < 5, `seed {seed} arrives, {body.position}`)
+				else
+					abandoned += 1
+					T.equal(count(stats.events, "aboutFaceAbandon"), 1, `seed {seed} reported the change of mind`)
+				end
+			end
+			T.check(finished >= 5, `most trips finish ({finished})`)
+			T.check(abandoned >= 1, `a planned change of mind still happens ({abandoned})`)
+		end)
+
+		T.it("an about-face that starts next to the follower's target is skipped", function()
+			local from, to = Vector3.new(0, 0, 0), Vector3.new(0, 0, 40)
+			local skipped, abandonedTrips = 0, 0
+			for seed = 410, 419 do
+				local rng = Rng.new(seed)
+				local profile = InputProfile.sample(rng:fork("profile"), "pc")
+				local p = table.clone(quiet)
+				p.aboutFaceRate = 1
+				local humanizer = Humanizer.new(rng:fork("human"), profile, p)
+				local follower = WaypointFollower.new(path({ { from }, { to } }), from, 0)
+				humanizer:beginTrip(follower, 0, seed)
+				local body = Sim.new(from)
+				local function tick(now)
+					local out = follower:tick(body:state(), now)
+					return humanizer:apply({
+						command = out.command,
+						body = body:state(),
+						now = now,
+						dt = 0.1,
+						followerEvents = out.events,
+					})
+				end
+				tick(0)
+				-- Stand 1.5 studs short of the stop point when the about-face (due by 5 s) fires.
+				body.position = follower.finalTarget - Vector3.new(0, 0, 1.5)
+				local first = tick(5.5)
+				T.equal(#first.events, 1, `seed {seed} fires the about-face`)
+				T.equal(first.events[1].kind, "aboutFace")
+				T.equal(first.command.mode, "stop", "phase 1 stops")
+				-- Phase 1 lasts at most 0.3 s, so the tick at 6 s moves to phase 2; its first walking
+				-- tick sees the target within 2 studs and gives up at once.
+				tick(6)
+				local second = tick(6.1)
+				T.check(not humanizer:isBusy(), `seed {seed} handed the wheel back`)
+				T.check(not follower:isPaused(), `seed {seed} leaves the follower running`)
+				if second.abandonTrip then
+					abandonedTrips += 1
+					T.equal(#second.events, 1)
+					T.equal(second.events[1].kind, "aboutFaceAbandon")
+				else
+					skipped += 1
+					T.equal(second.command.mode, "move", `seed {seed} walks on the same tick`)
+					T.check(second.command.dir.Z > 0.9, "toward the stop point")
+				end
+			end
+			T.check(skipped >= 4, `most trips carry on ({skipped})`)
+			T.check(abandonedTrips >= 1, `a planned change of mind still happens ({abandonedTrips})`)
+		end)
+
+		T.it("an event that ends on a paused follower resumes it", function()
+			-- A link hold (Custom waypoint) at a sharp corner where a hesitation fires in the same
+			-- tick: the follower pauses for a decision, the humanizer stops for its hesitation,
+			-- and nobody else answers. The end of the hesitation must release the hold.
+			for seed = 420, 424 do
+				local rng = Rng.new(seed)
+				local profile = InputProfile.sample(rng:fork("profile"), "pc")
+				local p = table.clone(quiet)
+				p.caution = 10 -- hesitation chance past 1 whatever the profile's jitter
+				local humanizer = Humanizer.new(rng:fork("human"), profile, p)
+				local waypoints = path({
+					{ Vector3.new(0, 0, 0) },
+					{ Vector3.new(20, 0, 0), "Custom" },
+					{ Vector3.new(20, 0, 20) },
+				})
+				local follower = WaypointFollower.new(waypoints, Vector3.zero, 0)
+				humanizer:beginTrip(follower, 0, seed)
+				local body = Sim.new(Vector3.zero)
+				local holdingDuringEvent = false
+				local stats = drive(humanizer, follower, body, 20, function(kind)
+					if kind == "hesitation" then
+						holdingDuringEvent = follower:isPaused()
+					end
+				end)
+				T.equal(count(stats.events, "hesitation"), 1, `seed {seed} hesitated at the link`)
+				T.check(holdingDuringEvent, `seed {seed} follower was holding when the hesitation started`)
+				T.check(stats.finished, `seed {seed} finishes`)
+				T.check(not follower:isPaused(), `seed {seed} leaves the follower running`)
+				T.check(NavMath.flatDistance(body.position, Vector3.new(20, 0, 20)) < 5, `seed {seed} arrives`)
+			end
+		end)
+
+		T.it("a wall bump leans on the wall instead of sliding away along the old heading", function()
+			-- The path turns sharply at a wall it meets at an angle, so a body holding the old
+			-- heading slides along the wall (+Z) for the whole extra time. Steering at the wall
+			-- probe point every tick keeps it by the corner. (The turn is 73 degrees so it stays
+			-- past the 60-degree wall-bump threshold after any corner clip.)
+			local corner = Vector3.new(10, 0, 3)
+			local points = { { Vector3.zero }, { corner }, { Vector3.new(10, 0, 15) } }
+			local function wallAt(x)
+				return x >= 11
+			end
+			local longest = 0
+			for seed = 430, 439 do
+				local rng = Rng.new(seed)
+				local profile = InputProfile.sample(rng:fork("profile"), "pc")
+				local p = table.clone(quiet)
+				p.wallBumpRate = 1
+				local humanizer = Humanizer.new(rng:fork("human"), profile, p, {
+					walkableCheck = function(point)
+						return if wallAt(point.X) then "wall" else "walkable"
+					end,
+				})
+				local follower = WaypointFollower.new(path(points), Vector3.zero, 0)
+				humanizer:beginTrip(follower, 0, seed)
+				local body = Sim.new(Vector3.zero, {
+					blockedAt = function(x, _z)
+						return wallAt(x)
+					end,
+				})
+				local stats = drive(humanizer, follower, body, 30)
+				T.equal(count(stats.events, "wallBump"), 1, `seed {seed} bumped`)
+				T.check(stats.finished, `seed {seed} finishes`)
+				T.check(not follower:isPaused(), `seed {seed} leaves the follower running`)
+				local window = stats.busy[1]
+				local peakZ = peakDuring(stats, window, function(position)
+					return position.Z
+				end)
+				-- The probe sits at most ~5.5 studs along Z; holding the old heading would have slid
+				-- 4.6 studs per second of extra time.
+				T.check(peakZ < 8, `seed {seed} stayed by the corner while pushing (z {peakZ})`)
+				longest = math.max(longest, window.to - window.from)
+			end
+			T.check(longest >= 1.5, `some bump pushed long enough to have slid away ({longest} s)`)
+
+			-- With nothing to push against the bump is a short overshoot of the corner, not a
+			-- walk into the distance for the extra time.
+			for seed = 440, 449 do
+				local rng = Rng.new(seed)
+				local profile = InputProfile.sample(rng:fork("profile"), "pc")
+				local p = table.clone(quiet)
+				p.wallBumpRate = 1
+				local humanizer = Humanizer.new(rng:fork("human"), profile, p)
+				local follower = WaypointFollower.new(path(points), Vector3.zero, 0)
+				humanizer:beginTrip(follower, 0, seed)
+				local turn = follower.waypoints[2].position -- possibly clipped
+				local body = Sim.new(Vector3.zero)
+				local stats = drive(humanizer, follower, body, 30)
+				T.equal(count(stats.events, "wallBump"), 1, `seed {seed} bumped`)
+				T.check(stats.finished, `seed {seed} finishes`)
+				T.check(not follower:isPaused(), `seed {seed} leaves the follower running`)
+				local peak = peakDuring(stats, stats.busy[1], function(position)
+					return NavMath.flatDistance(position, turn)
+				end)
+				T.check(peak <= 4.5, `seed {seed} overshoots the corner by little ({peak})`)
+			end
 		end)
 	end)
 end

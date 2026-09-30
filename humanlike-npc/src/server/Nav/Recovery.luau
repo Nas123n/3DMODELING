@@ -5,6 +5,13 @@
 -- chosen once is kept for the episode, and a hopeless goal is abandoned rather than oscillated
 -- at. The ladder never touches the world: it emits small actions and requests, and is told
 -- about progress by whoever runs it.
+--
+-- The verdict that starts an episode decides how high it enters: "stuck" (poor progress) starts
+-- with the nudge, "pushing" (walked into something) skips it, "oscillating" (dithering between
+-- two ways round) is a stuck that also skips it and enters at the back-and-jump level, and
+-- "wallCapped" (pushed a wall for seconds) is a pushing that goes straight to the repath level.
+-- Anything else is treated as "stuck".
+-- requires: NavMath, Rng, Types
 
 local NavMath = require(script.Parent.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -157,14 +164,27 @@ local function u(self: Ladder, lo: number, hi: number): number
 	return self.rng:range(lo, hi)
 end
 
+-- The lowest level an episode may start at for a verdict: pushing and oscillating skip the nudge
+-- (a person who walked into a wall backs up, one dithering stops and hops), a capped wall goes
+-- straight to a new route. Unknown verdicts are plain "stuck".
+local function entryLevel(verdict: string): number
+	if verdict == "wallCapped" then
+		return 2
+	elseif verdict == "pushing" or verdict == "oscillating" then
+		return 1
+	end
+	return 0
+end
+
 -- Starts an episode. `forward` is the direction the NPC was trying to walk; probes are the free
--- distances of two short raycasts at +-60 degrees (nil when unknown).
+-- distances of two short raycasts at +-60 degrees (nil when unknown). `verdict` is the detector's
+-- word: "stuck" | "pushing" | "oscillating" | "wallCapped" (any other string counts as "stuck").
 function Recovery.onStuck(
 	self: Ladder,
 	now: number,
 	body: BodyState,
 	forward: Vector3,
-	verdict: "stuck" | "pushing",
+	verdict: string,
 	probeLeft: number?,
 	probeRight: number?
 ): number
@@ -176,9 +196,7 @@ function Recovery.onStuck(
 	else
 		self.level = 0
 	end
-	if verdict == "pushing" and self.level == 0 then
-		self.level = 1 -- a person who walked into a wall backs up; no nudging first
-	end
+	self.level = math.max(self.level, entryLevel(verdict))
 	self.lastFailureAt = now
 	if not self.firstStuckOnGoalAt then
 		self.firstStuckOnGoalAt = now

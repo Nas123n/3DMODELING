@@ -9,7 +9,14 @@
 --
 -- Names are never real people: the word lists are generic, and callers should still run the
 -- optional online check (Players:GetUserIdFromNameAsync) in the Roblox adapter to drop any
--- collision with an existing account. A Pool hands out unique names per server.
+-- collision with an existing account; the adapter reports a hit with `pool:reject(name)` and
+-- that name is never handed out again for the run. A Pool hands out unique names per server,
+-- drawing a studio's own alt-account usernames (`preferred`) first, in order.
+--
+-- The draw order of `generate` for a given seed is pinned by Names.spec: an optional
+-- `accountAgeDays` biases the family mix (one draw either way) and keeps birth-year digit
+-- suffixes for accounts older than 1500 days; without it every call draws exactly as before.
+-- requires: Rng
 
 local Rng = require(script.Parent.Parent.Rng)
 
@@ -263,6 +270,48 @@ Names.BANNED = {
 	"system",
 	"server",
 	"helper",
+	-- Well-known creator and streamer handle stems (impersonation, research on name tells).
+	-- None of these is a substring of any word the generator can produce, so adding them does
+	-- not change the seeded draw order (Names.spec pins it).
+	"rblx",
+	"mrflimflam",
+	"flimflam",
+	"funneh",
+	"kreek",
+	"lankybox",
+	"sharkblox",
+	"russoplays",
+	"gamingwithkev",
+	"gamingwithjen",
+	"sniperwolf",
+	"ssundee",
+	"thnxcya",
+	"cookieswirlc",
+	"iamsanna",
+	"sanna",
+	"fgteev",
+	"kindlykeyin",
+	"conor",
+	"pinkleaf",
+	"mrbeast",
+	"pewdiepie",
+	"markiplier",
+	"jacksepticeye",
+	"technoblade",
+	"tommyinnit",
+	"georgenotfound",
+	"sapnap",
+	"quackity",
+	"wilbursoot",
+	"philza",
+	"ranboo",
+	"aphmau",
+	"jelly",
+	"kaicenat",
+	"ishowspeed",
+	"pokediger",
+	"krystin",
+	"goldenglare",
 }
 
 -- "player" followed by digits is a classic placeholder; "player" inside another word is fine.
@@ -270,14 +319,25 @@ local PLAYER_PATTERN = "^[Pp]layer_?%d+$"
 
 local LEET_MAP = { a = "4", e = "3", i = "1", o = "0", s = "5", t = "7" }
 
+-- Birth-year digit suffixes (2009, 2013) belong to accounts older than this many days; a brand
+-- new account with "2011" in its name is a tell. nil (no persona known) keeps the landed mix.
+local YEAR_SUFFIX_MIN_DAYS = 1500
+
 local function capitalize(word: string): string
 	return string.upper(string.sub(word, 1, 1)) .. string.sub(word, 2)
 end
 
-local function digits(rng: Rng): string
+local function yearsAllowed(accountAgeDays: number?): boolean
+	return accountAgeDays == nil or accountAgeDays > YEAR_SUFFIX_MIN_DAYS
+end
+
+local function digits(rng: Rng, accountAgeDays: number?): string
 	local roll = rng:next()
 	if roll < 0.45 then
-		return tostring(rng:int(2009, 2016)) -- birth-year style
+		if yearsAllowed(accountAgeDays) then
+			return tostring(rng:int(2009, 2016)) -- birth-year style
+		end
+		return tostring(rng:int(10, 99)) -- a young account: an age-like number instead
 	elseif roll < 0.75 then
 		return tostring(rng:int(1, 99))
 	elseif roll < 0.9 then
@@ -306,8 +366,10 @@ local function underscoreJoin(rng: Rng, a: string, b: string): string
 	return if rng:chance(0.5) then a .. "_" .. b else a .. b
 end
 
-local GENERATORS: { [string]: (Rng) -> string } = {
-	wordDigits = function(rng)
+-- Each generator draws in a fixed order; `accountAgeDays` (optional) only changes which digits
+-- a draw turns into, never how many draws happen on the landed (nil) path.
+local GENERATORS: { [string]: (Rng, number?) -> string } = {
+	wordDigits = function(rng, accountAgeDays)
 		local roll = rng:next()
 		local base
 		if roll < 0.4 then
@@ -320,7 +382,7 @@ local GENERATORS: { [string]: (Rng) -> string } = {
 		if rng:chance(0.3) then
 			base = capitalize(base)
 		end
-		return underscoreJoin(rng, base, digits(rng))
+		return underscoreJoin(rng, base, digits(rng, accountAgeDays))
 	end,
 	camelCompound = function(rng)
 		local parts = { capitalize(rng:pick(ADJECTIVES)), capitalize(rng:pick(NOUNS)) }
@@ -338,12 +400,12 @@ local GENERATORS: { [string]: (Rng) -> string } = {
 		end
 		return rng:pick(ADJECTIVES) .. rng:pick(FIRST_NAMES)
 	end,
-	prefixed = function(rng)
+	prefixed = function(rng, accountAgeDays)
 		local core = if rng:chance(0.6) then rng:pick(FIRST_NAMES) else rng:pick(NOUNS)
 		local name = rng:pick(PREFIXES) .. core
 		if rng:chance(0.3) then
 			name = name .. "_"
-			name = string.sub(name, 1, #name - 1) .. digits(rng) -- never end with an underscore
+			name = string.sub(name, 1, #name - 1) .. digits(rng, accountAgeDays) -- never end with an underscore
 		end
 		if rng:chance(0.25) then
 			name = capitalize(name)
@@ -370,8 +432,10 @@ local GENERATORS: { [string]: (Rng) -> string } = {
 		-- Roblox's own suggestion when a name is taken: Word + Word + digits.
 		return capitalize(rng:pick(ADJECTIVES)) .. capitalize(rng:pick(NOUNS)) .. tostring(rng:int(1000, 9999))
 	end,
-	numeric = function(rng)
-		if rng:chance(0.5) then
+	numeric = function(rng, accountAgeDays)
+		-- The chance is drawn first either way so the landed path is unchanged; a young account
+		-- never gets the birth-year form.
+		if rng:chance(0.5) or not yearsAllowed(accountAgeDays) then
 			return tostring(rng:int(1000000, 9999999))
 		end
 		return tostring(rng:int(2009, 2016)) .. "_" .. capitalize(rng:pick(FIRST_NAMES))
@@ -427,12 +491,32 @@ function Names.isBanned(name: string): boolean
 	return false
 end
 
-local function pickFamily(rng: Rng): string
+-- Family multipliers by account age (research: brand-new accounts carry the auto-suggested and
+-- number-heavy shapes; veterans the aesthetic, phrase and creator shapes).
+local YOUNG_ACCOUNT_DAYS = 30
+local VETERAN_ACCOUNT_DAYS = 800
+local YOUNG_BIAS: { [string]: number } = { wordDigits = 2, numeric = 3, suggested = 3 }
+local VETERAN_BIAS: { [string]: number } = { lowercaseAesthetic = 2, phrase = 2, creatorHandle = 1.5 }
+
+-- Family weights in `Names.FAMILIES` order; the plain table weights when no account age is given.
+function Names.familyWeights(accountAgeDays: number?): { number }
+	local bias: { [string]: number }? = nil
+	if accountAgeDays ~= nil then
+		if accountAgeDays < YOUNG_ACCOUNT_DAYS then
+			bias = YOUNG_BIAS
+		elseif accountAgeDays > VETERAN_ACCOUNT_DAYS then
+			bias = VETERAN_BIAS
+		end
+	end
 	local weights = {}
 	for i, family in FAMILIES do
-		weights[i] = family.weight
+		weights[i] = family.weight * (if bias then bias[family.key] or 1 else 1)
 	end
-	return FAMILIES[rng:weightedIndex(weights)].key
+	return weights
+end
+
+local function pickFamily(rng: Rng, accountAgeDays: number?): string
+	return FAMILIES[rng:weightedIndex(Names.familyWeights(accountAgeDays))].key
 end
 
 -- The name above the head. About a fifth of players leave it equal to the username; the rest
@@ -465,12 +549,14 @@ local function displayNameFor(rng: Rng, username: string): string
 end
 
 -- One plausible name. Retries until the username passes the rules and the ban list.
-function Names.generate(rng: Rng, family: string?): Name
+-- `accountAgeDays` (persona.accountAgeDays) biases the family mix and the digit suffixes; nil
+-- draws exactly the landed sequence.
+function Names.generate(rng: Rng, family: string?, accountAgeDays: number?): Name
 	for _ = 1, 50 do
-		local key = family or pickFamily(rng)
+		local key = family or pickFamily(rng, accountAgeDays)
 		local generator = GENERATORS[key]
 		assert(generator, `unknown name family {key}`)
-		local username = generator(rng)
+		local username = generator(rng, accountAgeDays)
 		if Names.isValidUsername(username) and not Names.isBanned(username) then
 			local displayName = displayNameFor(rng, username)
 			if not Names.isValidDisplayName(displayName) then
@@ -489,17 +575,41 @@ local Pool = {}
 Pool.__index = Pool
 
 export type Pool = typeof(setmetatable(
-	{} :: { rng: Rng, taken: { [string]: boolean }, reserved: { [string]: boolean } },
+	{} :: {
+		rng: Rng,
+		taken: { [string]: boolean },
+		reserved: { [string]: boolean },
+		rejected: { [string]: boolean }, -- unusable for the rest of the run; release never clears it
+		preferred: { string }, -- a studio's own alt-account usernames, handed out first, in order
+	},
 	Pool
 ))
 
-function Names.newPool(rng: Rng, reserved: { string }?): Pool
+-- Family tag of a name that came from `preferred` rather than a generator.
+Names.PREFERRED_FAMILY = "preferred"
+
+-- `reserved`: names in use already (real players). `preferred`: usernames to hand out before any
+-- generated name, in order (Config.ReservedNames). Entries are trimmed; an invalid username or a
+-- case-insensitive duplicate is ignored. Preferred names skip the ban list on purpose (the studio
+-- owns those accounts) but still respect reservations and rejections.
+function Names.newPool(rng: Rng, reserved: { string }?, preferred: { string }?): Pool
 	local taken = {}
 	local initial: { string } = reserved or {}
 	for _, name in initial do
 		taken[string.lower(name)] = true
 	end
-	return setmetatable({ rng = rng, taken = taken, reserved = {} }, Pool)
+	local ordered: { string } = {}
+	local seen: { [string]: boolean } = {}
+	local wanted: { string } = preferred or {}
+	for _, raw in wanted do
+		local name = string.match(raw, "^%s*(.-)%s*$") or ""
+		local key = string.lower(name)
+		if Names.isValidUsername(name) and not seen[key] then
+			seen[key] = true
+			table.insert(ordered, name)
+		end
+	end
+	return setmetatable({ rng = rng, taken = taken, reserved = {}, rejected = {}, preferred = ordered }, Pool)
 end
 
 -- Marks a name as in use (a real player's username, so no NPC ever shares it).
@@ -511,11 +621,39 @@ function Pool.release(self: Pool, name: string)
 	self.taken[string.lower(name)] = nil
 end
 
-function Pool.take(self: Pool, family: string?): Name
+-- Marks a name unusable for the rest of the run (it resolved to a real account, or the
+-- developer refused it). `take` never returns it again and `release` does not bring it back.
+function Pool.reject(self: Pool, name: string)
+	local key = string.lower(name)
+	self.rejected[key] = true
+	self.taken[key] = true
+end
+
+function Pool.isRejected(self: Pool, name: string): boolean
+	return self.rejected[string.lower(name)] == true
+end
+
+-- The display name a preferred username gets: the username itself, its underscore read as a
+-- space ("Studio_Alt" → "Studio Alt"), which is always a valid display name.
+local function preferredDisplayName(username: string): string
+	return (string.gsub(username, "_", " "))
+end
+
+-- Preferred names go first, in order, whenever one is free (a released preferred name is
+-- preferred again); they consume no draws, so the generated names that follow are exactly the
+-- ones a pool without `preferred` would produce.
+function Pool.take(self: Pool, family: string?, accountAgeDays: number?): Name
+	for _, username in self.preferred do
+		local key = string.lower(username)
+		if not self.taken[key] and not self.rejected[key] then
+			self.taken[key] = true
+			return { username = username, displayName = preferredDisplayName(username), family = Names.PREFERRED_FAMILY }
+		end
+	end
 	for _ = 1, 200 do
-		local name = Names.generate(self.rng, family)
+		local name = Names.generate(self.rng, family, accountAgeDays)
 		local key = string.lower(name.username)
-		if not self.taken[key] then
+		if not self.taken[key] and not self.rejected[key] then
 			self.taken[key] = true
 			return name
 		end

@@ -13,10 +13,19 @@
 -- through blocked ones). The result is string-pulled so walks between corners are straight
 -- lines; jumps are never smoothed away.
 --
+-- A search can be sliced: with `PathOptions.yieldEvery` set, `findPath` yields every that many
+-- expanded nodes when it is driven from a coroutine (GridPathProvider's budgeted mode), and the
+-- result is byte-identical to the synchronous one. Called from the thread that loaded this module
+-- (a test's top level, a Script's main thread) it never yields: that thread reports itself as
+-- yieldable under both runtimes, yet nothing would ever resume it.
+--
 -- Everything here is plain Luau over Vector3, so it runs identically in Studio and under Lune.
 
 local NavGrid = {}
 NavGrid.__index = NavGrid
+
+-- The thread this module was loaded from. A search running on it is never sliced.
+local hostThread: thread? = coroutine.running()
 
 export type Action = "Walk" | "Jump"
 
@@ -63,6 +72,10 @@ export type PathOptions = {
 	jumpCost: number?, -- multiplier on jump link length; default 1.6 (jumping costs time)
 	smooth: boolean?, -- string pulling; default true
 	snapRadius: number?, -- studs to search for a walkable cell around start/goal; default 8
+	-- When > 0 and the search runs inside a coroutine (not the module's host thread), yield after this
+	-- many expanded nodes; the resumer passes nothing back. Default nil: synchronous. About 20 us per
+	-- node under Lune, so 64 gives slices of roughly 1.3 ms.
+	yieldEvery: number?,
 }
 
 export type Grid = typeof(setmetatable(
@@ -426,6 +439,8 @@ function NavGrid.findPath(self: Grid, from: Vector3, to: Vector3, options: PathO
 	local maxJumpGap = o.maxJumpGap or 6
 	local jumpCost = o.jumpCost or 1.6
 	local snapRadius = o.snapRadius or 8
+	local yieldEvery = o.yieldEvery or 0
+	local sliced = yieldEvery > 0 and coroutine.isyieldable() and coroutine.running() ~= hostThread
 	-- A chasm of k missing cells is crossed by a link k + 1 cells long.
 	local gapCells = if jumpHeight > 0 and maxJumpGap > 0 then math.floor(maxJumpGap / self.cellSize + 1e-6) + 1 else 0
 
@@ -573,6 +588,12 @@ function NavGrid.findPath(self: Grid, from: Vector3, to: Vector3, options: PathO
 					consider(current, cx, cz, tx, tz, gap, true)
 				end
 			end
+		end
+
+		-- A slice ends here, after the node's edges are in the open set, so the order of expansion
+		-- (and therefore the result) is exactly the synchronous one.
+		if sliced and expanded % yieldEvery == 0 then
+			coroutine.yield()
 		end
 	end
 

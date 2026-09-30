@@ -8,6 +8,11 @@
 --
 -- Rates are deliberately low: a person who stumbles constantly reads as broken, not human. At
 -- the defaults an NPC bumps a wall about once per fifty trips and turns around once in fourteen.
+--
+-- Every scripted event is bounded: an about-face that cannot walk its rewind line (a wall across
+-- it) gives up after a few seconds, a wall bump steers at the wall itself instead of walking
+-- away along the old heading, and a follower left holding when an event ends is resumed, so the
+-- humanizer can never leave a trip that would otherwise finish hanging.
 
 local NavMath = require(script.Parent.Parent.Nav.NavMath)
 local Rng = require(script.Parent.Parent.Rng)
@@ -67,6 +72,7 @@ type Planned = {
 	duration: number,
 	magnitude: number?, -- mobile hesitation: slow instead of stop
 	heading: Vector3?, -- wall bump: pre-corner heading
+	probe: Vector3?, -- wall bump: the point past the corner the body pushes toward (inside the wall)
 	extra: number?, -- wall bump: seconds to keep going
 	abandon: boolean?, -- about-face: change of mind
 	rewindStuds: number?,
@@ -84,7 +90,20 @@ type Active = {
 	dir: Vector3?,
 	magnitude: number?,
 	pushingSince: number?,
+	walkBackStartedAt: number?, -- about-face: when phase 2 began, for the give-up limit
 }
+
+-- An about-face stops walking its rewind line after this long, or once the follower's lookahead
+-- target is this close: the body is either blocked or already where the follower wants it.
+local ABOUT_FACE_WALK_BACK_LIMIT = 4
+local ABOUT_FACE_NEAR_TARGET = 2
+-- A wall bump probes this far past the corner (1 stud steps) for the wall it is about to hit;
+-- the probe point sits one stud inside the first wall sample. With no wall in range the body
+-- merely overshoots the corner by WALL_PROBE_OPEN studs; reaching a probe (within
+-- WALL_PROBE_REACH) means there was nothing to push, so the bump ends early.
+local WALL_PROBE_RANGE = 4
+local WALL_PROBE_OPEN = 2.5
+local WALL_PROBE_REACH = 0.75
 
 export type Input = {
 	command: MoveCommand,
@@ -193,6 +212,68 @@ local function turnAt(waypoints: { Waypoint }, i: number): (number, Vector3, Vec
 		return 0, din, dout
 	end
 	return math.abs(NavMath.turnAngle(din, dout)), din, dout
+end
+
+-- The point a wall bump pushes toward: one stud inside the first wall sample along the pre-corner
+-- heading, just short of a void, or a short overshoot when nothing is in range. No draws.
+local function wallProbe(self: HumanizerT, corner: Vector3, heading: Vector3): Vector3
+	local check = self.walkableCheck
+	if check then
+		for d = 1, WALL_PROBE_RANGE do
+			local verdict = check(corner + heading * d)
+			if verdict == "wall" then
+				return corner + heading * (d + 1)
+			elseif verdict == "void" then
+				return corner + heading * math.max(d - 1, 0.5)
+			end
+		end
+	end
+	return corner + heading * WALL_PROBE_OPEN
+end
+
+-- The point the follower is steering toward right now: the same lookahead rule the follower
+-- applies (furthest Walk waypoint within lookahead, level, in line of walk; the final target on
+-- the last one). Nil once the follower is done.
+local function followerTarget(follower: Follower, position: Vector3): Vector3?
+	local waypoints = follower.waypoints
+	local n = #waypoints
+	if follower.finished or follower.nextIndex > n then
+		return nil
+	end
+	local bestIndex = follower.nextIndex
+	local best = waypoints[bestIndex].position
+	local los = follower.losCheck
+	for k = bestIndex + 1, math.min(n, bestIndex + 6) do
+		local previous = waypoints[k - 1]
+		if previous.action ~= "Walk" then
+			break
+		end
+		local w = waypoints[k]
+		if math.abs(w.position.Y - previous.position.Y) > follower.stepHeight then
+			break
+		end
+		if NavMath.flatDistance(position, w.position) > follower.lookahead then
+			break
+		end
+		if los and not los(position, w.position) then
+			break
+		end
+		bestIndex, best = k, w.position
+	end
+	if bestIndex == n then
+		best = follower.finalTarget
+	end
+	return best
+end
+
+-- Ends the active event. A follower left holding (a link hold or a failed jump that landed while
+-- the humanizer had the wheel) is released, or the trip would wait for a decision nobody makes.
+local function endActive(self: HumanizerT)
+	self.active = nil
+	local follower = self.follower
+	if follower and follower:isPaused() then
+		follower:resume()
+	end
 end
 
 -- Plans this trip's imperfections and edits the follower's waypoints.
@@ -323,6 +404,7 @@ function Humanizer.beginTrip(self: HumanizerT, follower: Follower, now: number, 
 				kind = "wallBump",
 				index = pick.index,
 				heading = pick.heading,
+				probe = wallProbe(self, waypoints[pick.index].position, pick.heading),
 				extra = rng:logNormalClamped(1.0, 0.6, 0.4, 3.0),
 				duration = u(rng, 0.2, 0.6),
 			})
@@ -387,7 +469,7 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 	local rng = self.tripRng
 	if active.kind == "hesitation" then
 		if now >= active.phaseEndsAt then
-			self.active = nil
+			endActive(self)
 			return nil, false
 		end
 		if plan.magnitude then
@@ -398,7 +480,7 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 		return stop(), false
 	elseif active.kind == "distraction" then
 		if now >= active.phaseEndsAt then
-			self.active = nil
+			endActive(self)
 			return nil, false
 		end
 		return stop(), false
@@ -411,12 +493,12 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 			return stop(), false
 		end
 		if now >= active.phaseEndsAt then
-			self.active = nil
+			endActive(self)
 			return stop(), false
 		end
 		local dir = NavMath.flatDirection(input.body.position, plan.idealPoint or input.body.position)
 		if dir.Magnitude == 0 then
-			self.active = nil
+			endActive(self)
 			return stop(), false
 		end
 		return move(dir, 1), false
@@ -425,13 +507,31 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 		if active.phase == 1 then
 			if now >= active.phaseEndsAt then
 				active.phase = 2
+				active.walkBackStartedAt = now
 			end
 			return stop(), false
 		elseif active.phase == 2 then
 			self.suppressedUntil = math.max(self.suppressedUntil, now + 1)
+			local follower = self.follower :: Follower
+			local position = input.body.position
+			-- Give up the walk back when it has taken too long (a wall across the rewound line) or
+			-- the body is already where the follower wants it: hand the wheel straight back. The
+			-- planned change of mind still stands, so the abandon rate does not depend on walls.
+			local target = followerTarget(follower, position)
+			local nearTarget = target ~= nil and NavMath.flatDistance(position, target) < ABOUT_FACE_NEAR_TARGET
+			if now - (active.walkBackStartedAt or now) >= ABOUT_FACE_WALK_BACK_LIMIT or nearTarget then
+				u(rng, 0.3, 1.0) -- the phase-3 hold this about-face skips; keeps the trip stream aligned
+				follower:resume()
+				endActive(self)
+				if plan.abandon then
+					table.insert(events, { kind = "aboutFaceAbandon", at = now })
+					return stop(), true
+				end
+				return nil, false
+			end
 			local points = active.points :: { Vector3 }
 			local index = active.pointIndex :: number
-			while index <= #points and NavMath.flatDistance(input.body.position, points[index]) < 1 do
+			while index <= #points and NavMath.flatDistance(position, points[index]) < 1 do
 				index += 1
 			end
 			active.pointIndex = index
@@ -440,11 +540,11 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 				active.phaseEndsAt = now + u(rng, 0.3, 1.0)
 				return stop(), false
 			end
-			local dir = NavMath.flatDirection(input.body.position, points[index])
+			local dir = NavMath.flatDirection(position, points[index])
 			return move(dir, 1), false
 		else
 			if now >= active.phaseEndsAt then
-				self.active = nil
+				endActive(self)
 				if plan.abandon then
 					table.insert(events, { kind = "aboutFaceAbandon", at = now })
 					return stop(), true
@@ -455,28 +555,39 @@ local function runActive(self: HumanizerT, input: Input, events: { Event }): (Mo
 		end
 	elseif active.kind == "wallBump" then
 		if active.phase == 1 then
-			-- Keep the pre-corner heading until the extra time passes or the wall is felt.
+			-- Push toward the wall probe point until the extra time passes or the wall is felt. The
+			-- direction is recomputed every tick, so a body that slid along the wall past the point
+			-- leans back toward it instead of walking off along the old heading; reaching the point
+			-- means there was no wall there, and the bump ends as a plain overshoot.
 			if input.stuckVerdict == "pushing" then
 				active.pushingSince = active.pushingSince or now
 			else
 				active.pushingSince = nil
 			end
 			local felt = active.pushingSince ~= nil and now - (active.pushingSince :: number) >= 0.4
-			if now >= active.phaseEndsAt or felt then
+			local probe = plan.probe
+			local dir = if probe then NavMath.flatDirection(input.body.position, probe) else nil
+			local reachedProbe = probe ~= nil
+				and active.pushingSince == nil
+				and NavMath.flatDistance(input.body.position, probe :: Vector3) < WALL_PROBE_REACH
+			if now >= active.phaseEndsAt or felt or reachedProbe then
 				active.phase = 2
 				active.phaseEndsAt = now + plan.duration
 				return stop(), false
 			end
-			return move(plan.heading or input.command.dir, 1), false
+			if dir == nil or (dir :: Vector3).Magnitude == 0 then
+				dir = plan.heading or input.command.dir
+			end
+			return move(dir :: Vector3, 1), false
 		end
 		if now >= active.phaseEndsAt then
-			self.active = nil
+			endActive(self)
 			self.suppressedUntil = -math.huge
 			return nil, false
 		end
 		return stop(), false
 	end
-	self.active = nil
+	endActive(self)
 	return nil, false
 end
 

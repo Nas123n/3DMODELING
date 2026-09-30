@@ -236,5 +236,44 @@ return function(T, Loader)
 				)
 			end
 		end)
+
+		local corner, opposite = Vector3.new(-50, 0, -50), Vector3.new(50, 0, 50)
+
+		T.it("yieldEvery slices and the result is identical", function()
+			local plain = grid:findPath(corner, opposite)
+			T.equal(plain.status, "Success")
+			T.check(plain.expanded > 64, `a long search, expanded {plain.expanded}`)
+			local thread = coroutine.create(function()
+				return grid:findPath(corner, opposite, { yieldEvery = 64 })
+			end)
+			local resumes = 0
+			local sliced = nil
+			while true do
+				local ok, result = coroutine.resume(thread)
+				T.check(ok, `search failed: {tostring(result)}`)
+				if coroutine.status(thread) == "dead" then
+					sliced = result
+					break
+				end
+				resumes += 1
+			end
+			T.equal(sliced.expanded, plain.expanded, "same expansions")
+			T.equal(sliced.status, plain.status)
+			T.equal(sliced.cost, plain.cost)
+			T.equal(#sliced.waypoints, #plain.waypoints, "same waypoints")
+			for i, w in plain.waypoints do
+				T.equal(sliced.waypoints[i].position, w.position)
+				T.equal(sliced.waypoints[i].action, w.action)
+			end
+			local expected = math.ceil(plain.expanded / 64) - 1
+			T.between(resumes, expected - 1, expected + 1, `yields for {plain.expanded} nodes`)
+		end)
+
+		T.it("yieldEvery outside a coroutine is synchronous", function()
+			local plain = grid:findPath(corner, opposite)
+			local result = grid:findPath(corner, opposite, { yieldEvery = 64 })
+			T.equal(result.expanded, plain.expanded)
+			T.equal(#result.waypoints, #plain.waypoints)
+		end)
 	end)
 end

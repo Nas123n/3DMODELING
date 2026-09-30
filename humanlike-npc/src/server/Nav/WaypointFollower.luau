@@ -275,18 +275,9 @@ local function moveToward(position: Vector3, target: Vector3, jump: boolean): Mo
 	return { mode = "move", dir = dir, magnitude = 1, jump = jump }
 end
 
-function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Output
-	local events: { Event } = {}
-	if self.finished then
-		return { command = stopCommand(), events = events, remaining = 0 }
-	end
-	if self.paused then
-		return { command = stopCommand(), events = events, remaining = self:remainingDistance(body.position) }
-	end
-	self.walkSpeedHint = body.walkSpeed
-
-	-- Advance past every waypoint we have reached (a lookahead can pass several at once). A Jump
-	-- waypoint is never advanced here: reaching it is the take-off cue handled below.
+-- Advances past every waypoint already reached (a lookahead can pass several at once). A Jump
+-- waypoint is never advanced here: reaching it is the take-off cue handled in tick.
+local function advance(self: Follower, body: BodyState, now: number, events: { Event })
 	while self.nextIndex <= #self.waypoints and self.jumpState == "none" and reached(self, self.nextIndex, body) do
 		local w = self.waypoints[self.nextIndex]
 		if w.action == "Jump" and self.waypoints[self.nextIndex + 1] then
@@ -309,6 +300,19 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 			break
 		end
 	end
+end
+
+function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Output
+	local events: { Event } = {}
+	if self.finished then
+		return { command = stopCommand(), events = events, remaining = 0 }
+	end
+	if self.paused then
+		return { command = stopCommand(), events = events, remaining = self:remainingDistance(body.position) }
+	end
+	self.walkSpeedHint = body.walkSpeed
+
+	advance(self, body, now, events)
 	if self.nextIndex > #self.waypoints then
 		self.finished = true
 		table.insert(events, { kind = "finished", index = #self.waypoints })
@@ -401,7 +405,10 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 				table.insert(self.walked, body.position)
 				self.nextIndex += 1 -- past the Jump waypoint; the landing is the next target
 				self.waypointStartedAt = now
-				self.segmentStart = body.position
+				-- The landing leg starts at the take-off point, so a landing we overshot counts as
+				-- reached instead of pulling us back toward the edge we just cleared.
+				self.segmentStart = w.position
+				advance(self, body, now, events)
 				if self.nextIndex > #self.waypoints then
 					self.finished = true
 					table.insert(events, { kind = "finished", index = #self.waypoints })

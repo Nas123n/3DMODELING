@@ -72,6 +72,7 @@ export type Follower = typeof(setmetatable(
 		losCheck: ((Vector3, Vector3) -> boolean)?,
 		paused: boolean, -- holding at a Custom waypoint or after a failed jump, until resume()
 		failedJump: number?, -- index of the Jump waypoint that failed, until resume()
+		stallSince: number?, -- standing at a late-trigger take-off without getting past it
 		walked: { Vector3 }, -- positions at each waypoint arrival, for rewind
 		finished: boolean,
 		walkSpeedHint: number,
@@ -106,6 +107,7 @@ function WaypointFollower.new(waypoints: { Waypoint }, start: Vector3, now: numb
 		losCheck = o.losCheck,
 		paused = false,
 		failedJump = nil,
+		stallSince = nil,
 		walked = { start },
 		finished = #waypoints == 0,
 		walkSpeedHint = 16,
@@ -280,9 +282,13 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 	end
 	self.walkSpeedHint = body.walkSpeed
 
-	-- Advance past every waypoint we have reached (a lookahead can pass several at once).
+	-- Advance past every waypoint we have reached (a lookahead can pass several at once). A Jump
+	-- waypoint is never advanced here: reaching it is the take-off cue handled below.
 	while self.nextIndex <= #self.waypoints and self.jumpState == "none" and reached(self, self.nextIndex, body) do
 		local w = self.waypoints[self.nextIndex]
+		if w.action == "Jump" and self.waypoints[self.nextIndex + 1] then
+			break
+		end
 		table.insert(events, { kind = "waypoint", index = self.nextIndex })
 		local angle = turnAngleAt(self, self.nextIndex)
 		if angle > math.rad(25) then
@@ -296,11 +302,6 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 		self.nextIndex += 1
 		self.waypointStartedAt = now
 		self.segmentStart = body.position
-		if w.action == "Jump" then
-			-- Reached the take-off point without the jump logic firing (walked past it): jump now.
-			self.nextIndex -= 1
-			break
-		end
 		if self.paused then
 			break
 		end
@@ -323,10 +324,25 @@ function WaypointFollower.tick(self: Follower, body: BodyState, now: number): Ou
 		if self.jumpState == "none" then
 			local trigger = self.jumpTrigger[self.nextIndex] or self.defaultJumpTrigger
 			local toTakeoff = NavMath.flatDistance(body.position, w.position)
-			-- Trigger when within `trigger` studs of the take-off point, or once past it.
+			-- Trigger when within `trigger` studs of the take-off point, or once past it. A negative
+			-- trigger means "late": only once past the take-off point by that many studs.
 			local leg = NavMath.flatDirection(self.segmentStart, w.position)
-			local passed = leg.Magnitude > 0 and NavMath.flat(body.position - w.position):Dot(leg) >= 0
-			if body.onGround and (toTakeoff <= math.max(trigger, 0) or passed) then
+			local along = if leg.Magnitude > 0 then NavMath.flat(body.position - w.position):Dot(leg) else 0
+			local atTakeoff = reached(self, self.nextIndex, body)
+			local ready
+			if trigger >= 0 then
+				ready = toTakeoff <= trigger or along >= 0 or atTakeoff
+			else
+				-- Late: only once past the take-off point; if something stops us there, go anyway.
+				ready = along >= -trigger
+				if not ready and atTakeoff then
+					self.stallSince = self.stallSince or now
+					ready = now - (self.stallSince :: number) >= 0.5
+				end
+			end
+			if body.onGround and ready then
+				self.stallSince = nil
+				table.insert(events, { kind = "waypoint", index = self.nextIndex })
 				self.jumpState = "requested"
 				self.jumpRequestedAt = now
 				self.jumpRetries = 0

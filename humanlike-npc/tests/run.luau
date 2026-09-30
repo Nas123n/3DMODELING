@@ -17,6 +17,7 @@ local suites = {
 	require("./WaypointFollower.spec"),
 	require("./NavRuntime.spec"),
 	require("./Human.spec"),
+	require("./Humanizer.spec"),
 }
 
 for _, suite in suites do

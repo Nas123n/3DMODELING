@@ -85,9 +85,18 @@ function Sim.step(self, command, dt: number)
 	local nextZ = self.position.Z + horizontal.Z * dt
 	local moved = true
 	if self.blockedAt(nextX, nextZ) then
-		moved = false
-		nextX, nextZ = self.position.X, self.position.Z
-		horizontal = Vector3.zero
+		-- Slide along the wall like physics would: keep whichever axis is still free.
+		if not self.blockedAt(nextX, self.position.Z) and math.abs(horizontal.X) > 1e-6 then
+			nextZ = self.position.Z
+			horizontal = Vector3.new(horizontal.X, 0, 0)
+		elseif not self.blockedAt(self.position.X, nextZ) and math.abs(horizontal.Z) > 1e-6 then
+			nextX = self.position.X
+			horizontal = Vector3.new(0, 0, horizontal.Z)
+		else
+			moved = false
+			nextX, nextZ = self.position.X, self.position.Z
+			horizontal = Vector3.zero
+		end
 	end
 
 	local y = self.position.Y
